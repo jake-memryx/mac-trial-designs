@@ -57,6 +57,6 @@ make clean
 make licenses
 ```
 
-The helper reports issued and currently used Xcelium and Genus licenses. Use
-`scripts/check_licenses.sh --all` for every feature and active user, or pass one
-or more FlexNet feature names to inspect only those features.
+The helper displays a compact table with each tool's version, total license
+seats, available seats, and a colored utilization bar. Use
+`scripts/check_licenses.sh --no-color` for plain output.
