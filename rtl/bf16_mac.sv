@@ -91,8 +91,10 @@ module fp32_adder (
                 shift_right_jam = {26'b0, |value};
             end else begin
                 sticky = 1'b0;
-                for (j = 0; j < amount; j = j + 1)
-                    sticky = sticky | value[j];
+                // Static loop bound keeps the index in range for synthesis.
+                for (j = 0; j < 27; j = j + 1)
+                    if (j < amount)
+                        sticky = sticky | value[j];
                 shift_right_jam = value >> amount;
                 shift_right_jam[0] = shift_right_jam[0] | sticky;
             end

@@ -21,6 +21,7 @@ syn_opt
 report gates   > gates.rpt
 report timing  > timing.rpt
 report area    > area.rpt
+report power   > power.rpt
 write_hdl      > counter8_mapped.sv
 write_sdc      > counter8.sdc
 
