@@ -46,11 +46,13 @@ genus_version=$(genus -version 2>&1 | awk -F 'Version: ' '/Program Name:/{print 
 xcelium_version=${xcelium_version:-unknown}
 genus_version=${genus_version:-unknown}
 
-declare -a tools=("Xcelium" "Genus")
-declare -a versions=("$xcelium_version" "$genus_version")
-declare -a features=("Xcelium_Single_Core" "Genus_Synthesis")
-declare -a totals=()
-declare -a available=()
+declare -a features=(
+    "Xcelium_Limited_Single_Core"
+    "Xcelium_Single_Core"
+    "Genus_Synthesis"
+)
+declare -a feature_totals=()
+declare -a feature_available=()
 
 status_regex='Total of ([0-9]+) licenses? issued;[[:space:]]+Total of ([0-9]+) licenses? in use'
 
@@ -59,13 +61,46 @@ for feature in "${features[@]}"; do
     if [[ $status =~ $status_regex ]]; then
         total=${BASH_REMATCH[1]}
         used=${BASH_REMATCH[2]}
-        totals+=("$total")
-        available+=("$((total - used))")
+        feature_totals+=("$total")
+        feature_available+=("$((total - used))")
     else
-        totals+=("-")
-        available+=("-")
+        feature_totals+=("-")
+        feature_available+=("-")
     fi
 done
+
+if [[ ${feature_totals[0]} != "-" && ${feature_totals[1]} != "-" ]]; then
+    xcelium_total=$((${feature_totals[0]} + ${feature_totals[1]}))
+    xcelium_available=$((${feature_available[0]} + ${feature_available[1]}))
+else
+    xcelium_total="-"
+    xcelium_available="-"
+fi
+
+declare -a tools=(
+    "Xcelium Limited SC"
+    "Xcelium Single Core"
+    "Xcelium Total"
+    "Genus"
+)
+declare -a versions=(
+    "$xcelium_version"
+    "$xcelium_version"
+    "$xcelium_version"
+    "$genus_version"
+)
+declare -a totals=(
+    "${feature_totals[0]}"
+    "${feature_totals[1]}"
+    "$xcelium_total"
+    "${feature_totals[2]}"
+)
+declare -a available=(
+    "${feature_available[0]}"
+    "${feature_available[1]}"
+    "$xcelium_available"
+    "${feature_available[2]}"
+)
 
 bar_width=16
 make_bar() {
@@ -92,12 +127,12 @@ make_bar() {
     printf '%s' "$reset"
 }
 
-printf '%s╭──────────┬────────────────┬───────┬───────────┬──────────────────╮%s\n' "$cyan" "$reset"
-printf '%s│%s %-8s %s│%s %-14s %s│%s %5s %s│%s %9s %s│%s %-16s %s│%s\n' \
+printf '%s╭──────────────────────┬────────────────┬───────┬───────────┬──────────────────╮%s\n' "$cyan" "$reset"
+printf '%s│%s %-20s %s│%s %-14s %s│%s %5s %s│%s %9s %s│%s %-16s %s│%s\n' \
     "$cyan" "$bold" "Tool" "$cyan" "$bold" "Version" "$cyan" \
     "$bold" "Total" "$cyan" "$bold" "Available" "$cyan" \
     "$bold" "Availability" "$cyan" "$reset"
-printf '%s├──────────┼────────────────┼───────┼───────────┼──────────────────┤%s\n' "$cyan" "$reset"
+printf '%s├──────────────────────┼────────────────┼───────┼───────────┼──────────────────┤%s\n' "$cyan" "$reset"
 
 for i in "${!tools[@]}"; do
     if [[ ${available[$i]} != "-" && ${available[$i]} -gt 0 ]]; then
@@ -106,7 +141,7 @@ for i in "${!tools[@]}"; do
         availability_color=$red
     fi
 
-    printf '%s│%s %-8s %s│%s %-14s %s│ %5s %s│%s %9s %s│ ' \
+    printf '%s│%s %-20s %s│%s %-14s %s│ %5s %s│%s %9s %s│ ' \
         "$cyan" "$bold" "${tools[$i]}" "$cyan" "$reset" "${versions[$i]}" \
         "$cyan" "${totals[$i]}" "$cyan" "$availability_color" \
         "${available[$i]}" "$cyan"
@@ -114,5 +149,5 @@ for i in "${!tools[@]}"; do
     printf ' %s│%s\n' "$cyan" "$reset"
 done
 
-printf '%s╰──────────┴────────────────┴───────┴───────────┴──────────────────╯%s\n' "$cyan" "$reset"
+printf '%s╰──────────────────────┴────────────────┴───────┴───────────┴──────────────────╯%s\n' "$cyan" "$reset"
 printf '%s█ available  %s░ in use%s\n' "$green" "$red" "$reset"

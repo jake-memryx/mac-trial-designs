@@ -83,6 +83,7 @@ make clean
 make licenses
 ```
 
-The helper displays a compact table with each tool's version, total license
+The helper displays separate Limited Single Core and Single Core Xcelium pools,
+their aggregate total, and Genus. Each row includes the tool version, total
 seats, available seats, and a colored utilization bar. Use
 `scripts/check_licenses.sh --no-color` for plain output.
