@@ -1,0 +1,8 @@
+# Cadence simulation and synthesis output
+build/
+xcelium.d/
+*.history
+*.log
+*.key
+waves.shm/
+

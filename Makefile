@@ -3,7 +3,7 @@ SHELL := /bin/bash
 XRUN  ?= xrun
 GENUS ?= genus
 
-.PHONY: all test sim synth clean
+.PHONY: all test sim synth licenses clean
 
 all: test
 
@@ -21,6 +21,9 @@ synth:
 	@mkdir -p build/synth
 	cd build/synth && $(GENUS) -batch -files ../../scripts/synth.tcl \
 		-log genus.log
+
+licenses:
+	@./scripts/check_licenses.sh
 
 clean:
 	rm -rf build

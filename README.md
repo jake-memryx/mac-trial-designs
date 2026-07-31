@@ -1,12 +1,12 @@
-# Verilog counter crash course
+# SystemVerilog counter crash course
 
 This small project demonstrates the basic RTL loop: write synthesizable
-Verilog, verify it with a self-checking SystemVerilog testbench, and synthesize
-it with Cadence Genus.
+SystemVerilog, verify it with a self-checking SystemVerilog testbench, and
+synthesize it with Cadence Genus.
 
 ## Layout
 
-- `rtl/counter.v` — synthesizable 8-bit counter
+- `rtl/counter.sv` — synthesizable 8-bit counter
 - `tb/counter_tb.sv` — self-checking testbench
 - `sim/files.f` — xrun source file list
 - `scripts/synth.tcl` — technology-independent Genus flow
@@ -50,3 +50,13 @@ add timing constraints and a real standard-cell library for technology mapping.
 ```sh
 make clean
 ```
+
+## Check Cadence licenses
+
+```sh
+make licenses
+```
+
+The helper reports issued and currently used Xcelium and Genus licenses. Use
+`scripts/check_licenses.sh --all` for every feature and active user, or pass one
+or more FlexNet feature names to inspect only those features.
