@@ -5,22 +5,24 @@ set_db auto_super_thread false
 set_db super_thread_servers ""
 
 set_db hdl_error_on_latch true
-
-# This Genus version requires a target library even for generic synthesis.
-# Fall back to the tutorial library shipped with the install.
-set genus_root [file dirname [file dirname [file dirname [exec which genus]]]]
-set tech_lib [file join $genus_root share synth tutorials tech tutorial.lib]
-read_libs $tech_lib
+source ../../scripts/cln4p_libraries.tcl
 
 read_hdl -sv ../../rtl/bf16_mac.sv
 elaborate bf16_mama -parameters {MAMS 8 ACCUMULATORS_PER_MAM 4}
 check_design -unresolved
+
+# 1.5 GHz clock (period in ns).
+create_clock -name clk -period 0.666667 [get_ports clk]
+
 syn_generic
+syn_map
+syn_opt
 
 report gates  > gates.rpt
 report timing > timing.rpt
 report area   > area.rpt
-write_hdl     > bf16_mama_generic.sv
+write_hdl     > bf16_mama_mapped.sv
+write_sdc     > bf16_mama.sdc
 
 puts "BF16 MAMA SYNTHESIS PASSED"
 exit

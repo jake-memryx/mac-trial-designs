@@ -4,7 +4,8 @@ XRUN  ?= xrun
 GENUS ?= genus
 
 .PHONY: all test sim test-counter test-bf16-mac test-bf16-mam test-bf16-mama \
-	test-bf16-multi-mac-tree synth synth-bf16-mac synth-bf16-mama licenses clean
+	test-bf16-multi-mac-tree cln4p-libs synth synth-bf16-mac \
+	synth-bf16-mama licenses clean
 
 all: test
 
@@ -47,19 +48,20 @@ test-bf16-multi-mac-tree:
 		-xmlibdirname build/sim_bf16_multi_mac_tree/xcelium.d \
 		-logfile build/sim_bf16_multi_mac_tree/xrun.log
 
-# Technology-independent synthesis. This checks that the RTL elaborates and
-# produces a generic gate-level netlist without requiring a standard-cell kit.
-synth:
+cln4p-libs:
+	@./scripts/prepare_cln4p_libs.sh build/cln4p_libs
+
+synth: cln4p-libs
 	@mkdir -p build/synth
 	cd build/synth && $(GENUS) -batch -files ../../scripts/synth.tcl \
 		-log genus.log
 
-synth-bf16-mac:
+synth-bf16-mac: cln4p-libs
 	@mkdir -p build/synth_bf16_mac
 	cd build/synth_bf16_mac && $(GENUS) -batch \
 		-files ../../scripts/synth_bf16_mac.tcl -log genus.log
 
-synth-bf16-mama:
+synth-bf16-mama: cln4p-libs
 	@mkdir -p build/synth_bf16_mama
 	cd build/synth_bf16_mama && $(GENUS) -batch \
 		-files ../../scripts/synth_bf16_mama.tcl -log genus.log

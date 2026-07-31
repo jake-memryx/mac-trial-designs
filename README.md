@@ -60,16 +60,18 @@ xrun -64bit -sv -f sim/files.f -top counter_tb \
   -logfile build/sim/xrun.log
 ```
 
-## Run generic synthesis
+## Run synthesis
 
 ```sh
 make synth
 ```
 
-This runs generic synthesis without a process-design-kit cell library. Reports
-and the generated generic netlist land in `build/synth/`. A later exercise can
-add timing constraints and a real standard-cell library for technology mapping.
-Use `make synth-bf16-mac` for the generic BF16 MAC synthesis flow.
+The synthesis flows target TSMC CLN4P Base and MB cells using SVT, LVT, and
+LVTLL CCS libraries at TT, 0.75 V, and 25 C. The first run extracts only those
+six views from the kit archives into `build/cln4p_libs/`. Genus maps and
+optimizes against a 1.5 GHz (`0.666667 ns`) clock. Reports, mapped netlists, and
+SDC files land under their respective `build/synth*` directories. Use
+`make synth-bf16-mac` or `make synth-bf16-mama` for those designs.
 
 ## Clean generated files
 

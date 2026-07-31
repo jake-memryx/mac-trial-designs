@@ -5,4 +5,4 @@ xcelium.d/
 *.log
 *.key
 waves.shm/
-
+.chipagents/
