@@ -4,7 +4,7 @@ XRUN  ?= xrun
 GENUS ?= genus
 
 .PHONY: all test sim test-counter test-bf16-mac test-bf16-mam test-bf16-mama \
-	test-bf16-multi-mac-tree synth synth-bf16-mac licenses clean
+	test-bf16-multi-mac-tree synth synth-bf16-mac synth-bf16-mama licenses clean
 
 all: test
 
@@ -58,6 +58,11 @@ synth-bf16-mac:
 	@mkdir -p build/synth_bf16_mac
 	cd build/synth_bf16_mac && $(GENUS) -batch \
 		-files ../../scripts/synth_bf16_mac.tcl -log genus.log
+
+synth-bf16-mama:
+	@mkdir -p build/synth_bf16_mama
+	cd build/synth_bf16_mama && $(GENUS) -batch \
+		-files ../../scripts/synth_bf16_mama.tcl -log genus.log
 
 licenses:
 	@./scripts/check_licenses.sh
