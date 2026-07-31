@@ -43,10 +43,13 @@ visible on the output. Run its tests with `make test-bf16-mam`.
 lanes. Each lane has separate operands, enable, selection, and output; reset and
 clear are shared. Run its tests with `make test-bf16-mama`.
 
-`bf16_multi_mac_tree` is the parallel alternative: `MULTIPLIERS` BF16 products
-feed a balanced FP32 adder tree, and the tree result is added to one selected
-FP32 accumulator. Non-power-of-two configurations are padded with zero leaves.
-Run its tests with `make test-bf16-multi-mac-tree`.
+`bf16_multi_mac_tree` is the parallel alternative. `MULTIPLIERS` exact 16-bit
+BF16 product significands are aligned to a shared exponent and reduced by a
+narrow signed integer tree. The tree is normalized and rounded to FP32 once,
+then added to one selected FP32 accumulator with a full FP32 adder. The
+`REDUCTION_GUARD_BITS` parameter controls the precision/efficiency tradeoff and
+non-power-of-two configurations are padded with zero leaves. Run its tests with
+`make test-bf16-multi-mac-tree`.
 
 To run the underlying command manually:
 

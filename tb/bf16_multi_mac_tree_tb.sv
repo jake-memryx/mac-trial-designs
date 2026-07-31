@@ -16,8 +16,9 @@ module bf16_multi_mac_tree_tb;
     int                      failures = 0;
 
     bf16_multi_mac_tree #(
-        .MULTIPLIERS (MULTIPLIERS),
-        .ACCUMULATORS (ACCUMULATORS)
+        .MULTIPLIERS          (MULTIPLIERS),
+        .ACCUMULATORS         (ACCUMULATORS),
+        .REDUCTION_GUARD_BITS (4)
     ) dut (.*);
 
     initial clk = 1'b0;
@@ -102,6 +103,20 @@ module bf16_multi_mac_tree_tb;
         @(negedge clk);
         expect_acc(1'd1, 32'h40800000, "enable holds accumulator");
 
+        // The block reduction keeps a 16-bit product significand plus four
+        // guard bits. A product 20 exponents below the maximum is therefore
+        // intentionally truncated: 1.0 + 2^-20 reduces to 1.0 here.
+        clear = 1'b1;
+        @(posedge clk);
+        @(negedge clk);
+        clear = 1'b0;
+        a[0] = 16'h3f80; b[0] = 16'h3f80; // 1.0
+        a[1] = 16'h3580; b[1] = 16'h3f80; // 2^-20
+        a[2] = 16'h0000; b[2] = 16'h0000;
+        a[3] = 16'h0000; b[3] = 16'h0000;
+        run_tree_mac(1'd0);
+        expect_acc(1'd0, 32'h3f800000, "guard-window truncation");
+
         clear = 1'b1;
         @(posedge clk);
         @(negedge clk);
@@ -122,4 +137,3 @@ module bf16_multi_mac_tree_tb;
         $fatal(1, "BF16 MULTI-MAC TREE TEST FAILED: timeout");
     end
 endmodule
-
