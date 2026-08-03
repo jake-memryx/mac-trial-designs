@@ -6,10 +6,8 @@ GENUS ?= genus
 .PHONY: all test sim test-counter test-bf16-mac test-bf16-mam test-bf16-mama \
 	test-bf16-multi-mac-tree test-bf16-mama-gemv \
 	test-bf16-multi-mac-tree-gemv cln4p-libs synth synth-bf16-mac \
-	synth-bf16-mama synth-bf16-multi-mac-tree synth-tree-quarter \
-	synth-tree-half synth-tree-full power-tree power-tree-quarter \
-	power-tree-half power-tree-full vcd-bf16-mama-gemv \
-	vcd-bf16-multi-mac-tree-gemv licenses clean
+	synth-bf16-mama synth-bf16-multi-mac-tree power-bf16-multi-mac-tree \
+	vcd-bf16-mama-gemv vcd-bf16-multi-mac-tree-gemv licenses clean
 
 all: test
 
@@ -78,10 +76,10 @@ build/vcd/bf16_mama_gemv.vcd: rtl/bf16_mac.sv tb/bf16_mama_gemv_tb.sv
 		-xmlibdirname build/vcd/xcelium.d.mama \
 		-logfile build/vcd/xrun_mama_gemv.log
 
-vcd-bf16-multi-mac-tree-gemv: build/vcd/bf16_multi_mac_tree_gemv_p0a0_2667ps.vcd
+vcd-bf16-multi-mac-tree-gemv: build/vcd/bf16_multi_mac_tree_gemv_p2a2_667ps.vcd
 
-# One VCD per synthesis point. The testbench clock matches the constrained
-# period so the toggle rates Genus reads are at the right frequency.
+# The testbench clock matches the constrained period so the toggle rates Genus
+# reads are at the right frequency.
 TREE_VCD_DEPS := rtl/bf16_mac.sv rtl/bf16_mac_tree_core.sv \
 	rtl/bf16_multi_mac_tree.sv tb/bf16_multi_mac_tree_gemv_tb.sv
 
@@ -97,16 +95,10 @@ build/vcd/bf16_multi_mac_tree_gemv_p$(1)a$(2)_$(3)ps.vcd: $$(TREE_VCD_DEPS)
 		-logfile build/vcd/xrun_tree_gemv_p$(1)a$(2)_$(3).log
 endef
 
-# Flat accumulate loop (the original sweep).
-$(eval $(call tree_vcd_rule,0,0,2667,2.666667))
-$(eval $(call tree_vcd_rule,1,0,1333,1.333333))
-$(eval $(call tree_vcd_rule,2,0,667,0.666667))
-
-# Pipelined accumulate loop.
-$(eval $(call tree_vcd_rule,2,1,667,0.666667))
+# Pipelined accumulate loop (the shipping configuration) and the flat
+# accumulate loop kept as a reference build.
 $(eval $(call tree_vcd_rule,2,2,667,0.666667))
-$(eval $(call tree_vcd_rule,0,2,2667,2.666667))
-$(eval $(call tree_vcd_rule,1,2,1333,1.333333))
+$(eval $(call tree_vcd_rule,2,0,667,0.666667))
 
 cln4p-libs:
 	@./scripts/prepare_cln4p_libs.sh build/cln4p_libs
@@ -126,34 +118,20 @@ synth-bf16-mama: cln4p-libs vcd-bf16-mama-gemv
 	cd build/synth_bf16_mama && $(GENUS) -batch \
 		-files ../../scripts/synth_bf16_mama.tcl -log genus.log
 
-# Tree-MAC synthesis sweep. 1x is the 1.5 GHz target; the slower points reuse
-# the same RTL with fewer pipeline stages.
-#   quarter: 375 MHz,  0 stages
-#   half:    750 MHz,  1 stage
-#   full:   1500 MHz,  2 stages
-synth-bf16-multi-mac-tree: synth-tree-quarter synth-tree-half synth-tree-full
-
-TREE_POINTS := quarter half full
-
-synth-tree-quarter power-tree-quarter: TREE_PERIOD          := 2.666667
-synth-tree-quarter power-tree-quarter: TREE_PIPELINE_STAGES := 0
-synth-tree-quarter power-tree-quarter: TREE_PERIOD_PS       := 2667
-synth-tree-half    power-tree-half:    TREE_PERIOD          := 1.333333
-synth-tree-half    power-tree-half:    TREE_PIPELINE_STAGES := 1
-synth-tree-half    power-tree-half:    TREE_PERIOD_PS       := 1333
-synth-tree-full    power-tree-full:    TREE_PERIOD          := 0.666667
-synth-tree-full    power-tree-full:    TREE_PIPELINE_STAGES := 2
-synth-tree-full    power-tree-full:    TREE_PERIOD_PS       := 667
-
-# Accumulate-loop pipeline depth for the sweep. Override on the command line,
-# e.g. 'make synth-tree-full TREE_ACC=2'. Results land in a per-depth directory
-# so the flat and pipelined variants can be compared side by side.
-TREE_ACC ?= 0
+# Tree-MAC synthesis at the 1.5 GHz target.
+#
+# TREE_ACC selects the accumulate-loop pipeline depth. 2 is the shipping
+# configuration; build the flat reference with 'TREE_ACC=0'. Results land in a
+# per-depth directory so the two can be compared side by side.
+TREE_PERIOD          := 0.666667
+TREE_PIPELINE_STAGES := 2
+TREE_PERIOD_PS       := 667
+TREE_ACC             ?= 2
 
 TREE_VCD = build/vcd/bf16_multi_mac_tree_gemv_p$(TREE_PIPELINE_STAGES)a$(TREE_ACC)_$(TREE_PERIOD_PS)ps.vcd
-TREE_DIR = build/synth_tree_$*_a$(TREE_ACC)
+TREE_DIR = build/synth_tree_a$(TREE_ACC)
 
-$(addprefix synth-tree-,$(TREE_POINTS)): synth-tree-%: cln4p-libs
+synth-bf16-multi-mac-tree: cln4p-libs
 	$(MAKE) $(TREE_VCD)
 	@mkdir -p $(TREE_DIR)
 	cd $(TREE_DIR) && \
@@ -166,12 +144,10 @@ $(addprefix synth-tree-,$(TREE_POINTS)): synth-tree-%: cln4p-libs
 
 # Re-annotate power on an existing netlist. No re-synthesis: activity is read
 # after syn_opt and no power-driven optimization is enabled.
-power-tree: $(addprefix power-tree-,$(TREE_POINTS))
-
-$(addprefix power-tree-,$(TREE_POINTS)): power-tree-%: cln4p-libs
+power-bf16-multi-mac-tree: cln4p-libs
 	$(MAKE) $(TREE_VCD)
 	@test -f $(TREE_DIR)/bf16_multi_mac_tree_mapped.sv || \
-		{ echo "run 'make synth-tree-$*' first"; exit 1; }
+		{ echo "run 'make synth-bf16-multi-mac-tree' first"; exit 1; }
 	cd $(TREE_DIR) && \
 		TREE_PIPELINE_STAGES=$(TREE_PIPELINE_STAGES) \
 		TREE_ACCUMULATE_STAGES=$(TREE_ACC) \

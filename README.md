@@ -73,13 +73,14 @@ optimizes against a 1.5 GHz (`0.666667 ns`) clock. Reports, mapped netlists, and
 SDC files land under their respective `build/synth*` directories. Use
 `make synth-bf16-mac` or `make synth-bf16-mama` for those designs.
 
-## Tree-MAC synthesis sweep results
+## Tree-MAC synthesis results
 
 CLN4P, `tt_0p75v_25c_typical`, `MULTIPLIERS=8`, `ACCUMULATORS=32`,
 `REDUCTION_GUARD_BITS=4`, zero wireload. Power is activity driven from the
 matched-frequency GEMV VCD. One OP is one BF16 MAC, so a cycle retires 8 OPs.
-Build with `make synth-tree-<point> TREE_ACC=<0|1|2>`; results land in
-`build/synth_tree_<point>_a<TREE_ACC>`.
+The design targets 1.5 GHz (`0.666667 ns`) with `PIPELINE_STAGES=2`. Build with
+`make synth-bf16-multi-mac-tree`, or `TREE_ACC=0` for the flat reference build;
+results land in `build/synth_tree_a<TREE_ACC>`.
 
 ### The problem
 
@@ -114,42 +115,32 @@ in flight must not be re-issued.
 
 ### Results
 
-`ACCUMULATE_STAGES=2`:
+Both builds are 1.5 GHz, `PIPELINE_STAGES=2`, from the same RTL:
 
-| Point | Period | Freq | Tree stages | Cells | Area (um2) | Power (mW) | pJ/OP | Slack |
-|---|---|---|---|---|---|---|---|---|
-| 1/4 | 2.667 ns | 375 MHz | 0 | 8467 | 624.1 | 1.466 | 0.489 | +15 ps |
-| 1/2 | 1.333 ns | 750 MHz | 1 | 9354 | 667.9 | 3.065 | 0.511 | +1 ps |
-| 1x | 0.667 ns | 1.5 GHz | 2 | 11413 | 765.4 | 6.402 | 0.534 | 0 ps |
+| Accumulate loop | Cells | Area (um2) | Power (mW) | pJ/cycle | pJ/OP | Slack |
+|---|---|---|---|---|---|---|
+| flat (`TREE_ACC=0`) | 13303 | 828.7 | 6.500 | 4.33 | 0.542 | -48 ps |
+| pipelined (`TREE_ACC=2`) | 11413 | 765.4 | 6.402 | 4.27 | 0.534 | **0 ps** |
 
-1x comparison against `ACCUMULATE_STAGES=0` built from the same RTL:
-
-| 1x variant | Cells | Area (um2) | Power (mW) | pJ/OP | Slack |
-|---|---|---|---|---|---|
-| flat accumulate | 13303 | 828.7 | 6.500 | 0.542 | -48 ps |
-| pipelined accumulate | 11413 | 765.4 | 6.402 | 0.534 | **0 ps** |
-
-The 1x point closes, and it does so while getting **smaller and lower power**:
+The design closes, and it does so while getting **smaller and lower power**:
 7.6% less area and 1.5% less energy per OP. Relieving the timing pressure lets
 Genus drop the upsized cells and duplicated logic it was using to chase an
 unreachable target, which more than pays for the ~100 bits of added pipeline
 register. The critical path is now
 `add_aligned_small_q_reg -> fp32_adder_normalize -> accumulator_bank_reg`.
 
-At the slower points the pipelining is a small net cost (1/4: 624.1 um2 and
-0.489 pJ/OP against 588.5 and 0.459 pre-refactor), because the extra registers
-buy timing that was not needed there. The recommendation is therefore
-`ACCUMULATE_STAGES=2` at 1x and `0` at the slower points.
-
 Two caveats on the numbers:
 
 - Splitting `fp32_adder` into two submodules changes the hierarchy Genus sees,
-  which shifts its optimization result. The same-RTL 1x flat point measures
-  828.7 um2 / -48 ps, against 811.2 um2 / -67 ps before the split. The 1x table
-  above therefore compares same-RTL builds; the 1/4 and 1/2 figures quoted for
-  comparison (588.5 and 653.4 um2) are pre-refactor and are reference only.
+  which shifts its optimization result. The flat build above measures
+  828.7 um2 / -48 ps, against 811.2 um2 / -67 ps before the split, so the table
+  compares same-RTL builds rather than quoting the older figure.
 - The Genus pool here allows only two concurrent seats, so run at most two
-  synthesis points in parallel.
+  synthesis jobs in parallel.
+
+`ACCUMULATE_STAGES=1` (registered bank read only, without splitting the adder)
+is functionally verified but was never needed to close timing, so it is not
+built by the flow.
 
 ### Rejected alternative
 
