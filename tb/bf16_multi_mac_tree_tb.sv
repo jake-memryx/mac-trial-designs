@@ -1,8 +1,17 @@
 `timescale 1ns/1ps
 
+// Override at compile time with -define ACCUMULATE_STAGES=<0|1|2> to run the
+// same directed checks against a pipelined accumulate loop.
+`ifndef ACCUMULATE_STAGES
+`define ACCUMULATE_STAGES 0
+`endif
+
 module bf16_multi_mac_tree_tb;
     localparam int unsigned MULTIPLIERS = 4;
     localparam int unsigned ACCUMULATORS = 2;
+    localparam int unsigned PIPELINE_STAGES = 0;
+    localparam int unsigned ACCUMULATE_STAGES = `ACCUMULATE_STAGES;
+    localparam int unsigned LATENCY = PIPELINE_STAGES + ACCUMULATE_STAGES;
     localparam int unsigned SELECT_WIDTH = $clog2(ACCUMULATORS);
 
     logic                    clk;
@@ -18,7 +27,9 @@ module bf16_multi_mac_tree_tb;
     bf16_multi_mac_tree #(
         .MULTIPLIERS          (MULTIPLIERS),
         .ACCUMULATORS         (ACCUMULATORS),
-        .REDUCTION_GUARD_BITS (4)
+        .REDUCTION_GUARD_BITS (4),
+        .PIPELINE_STAGES      (PIPELINE_STAGES),
+        .ACCUMULATE_STAGES    (ACCUMULATE_STAGES)
     ) dut (.*);
 
     initial clk = 1'b0;
@@ -31,6 +42,9 @@ module bf16_multi_mac_tree_tb;
         @(posedge clk);
         @(negedge clk);
         enable = 1'b0;
+        // Let the accumulate pipeline commit before the value is inspected.
+        repeat (LATENCY) @(posedge clk);
+        @(negedge clk);
     endtask
 
     task automatic expect_acc(input logic [SELECT_WIDTH-1:0] select,
@@ -99,7 +113,7 @@ module bf16_multi_mac_tree_tb;
             b[i] = 16'h42c8;
         end
         enable = 1'b0;
-        @(posedge clk);
+        repeat (LATENCY + 1) @(posedge clk);
         @(negedge clk);
         expect_acc(1'd1, 32'h40800000, "enable holds accumulator");
 

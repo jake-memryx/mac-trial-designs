@@ -13,9 +13,11 @@ set_db super_thread_servers ""
 
 source ../../scripts/cln4p_libraries.tcl
 
-set stages $env(TREE_PIPELINE_STAGES)
-set vcd    $env(TREE_VCD)
-set top    bf16_multi_mac_tree_MULTIPLIERS8_ACCUMULATORS32_REDUCTION_GUARD_BITS4_PIPELINE_STAGES$stages
+set stages     $env(TREE_PIPELINE_STAGES)
+set acc_stages [expr {[info exists env(TREE_ACCUMULATE_STAGES)] ?
+                      $env(TREE_ACCUMULATE_STAGES) : 0}]
+set vcd        $env(TREE_VCD)
+set top bf16_multi_mac_tree_MULTIPLIERS8_ACCUMULATORS32_REDUCTION_GUARD_BITS4_PIPELINE_STAGES${stages}_ACCUMULATE_STAGES$acc_stages
 
 read_hdl -netlist bf16_multi_mac_tree_mapped.sv
 elaborate $top

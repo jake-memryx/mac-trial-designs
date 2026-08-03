@@ -5,6 +5,11 @@
 `define PIPELINE_STAGES 0
 `endif
 
+// Override at compile time with -define ACCUMULATE_STAGES=<0|1|2>.
+`ifndef ACCUMULATE_STAGES
+`define ACCUMULATE_STAGES 0
+`endif
+
 // C[32] = A[1024] x B[1024][32] on a tree MAC with 8 multipliers and 32
 // accumulators. Eight A elements are held stationary while 32 cycles walk the
 // output columns: cycle j reduces the eight products A[k+i]*B[k+i][j] and folds
@@ -17,6 +22,8 @@ module bf16_multi_mac_tree_gemv_tb;
     localparam int unsigned DEPTH        = 1024;
     localparam int unsigned GROUPS       = DEPTH / MULTIPLIERS;
     localparam int unsigned PIPELINE_STAGES = `PIPELINE_STAGES;
+    localparam int unsigned ACCUMULATE_STAGES = `ACCUMULATE_STAGES;
+    localparam int unsigned LATENCY = PIPELINE_STAGES + ACCUMULATE_STAGES;
     localparam real         SIGMA        = 10.0;
     localparam real         TOLERANCE    = 1.0e-3;
 
@@ -39,7 +46,8 @@ module bf16_multi_mac_tree_gemv_tb;
         .MULTIPLIERS          (MULTIPLIERS),
         .ACCUMULATORS         (ACCUMULATORS),
         .REDUCTION_GUARD_BITS (4),
-        .PIPELINE_STAGES      (PIPELINE_STAGES)
+        .PIPELINE_STAGES      (PIPELINE_STAGES),
+        .ACCUMULATE_STAGES    (ACCUMULATE_STAGES)
     ) dut (.*);
 
     // Clock period in ns, overridable with +period=<ns> so a switching-activity
@@ -60,8 +68,9 @@ module bf16_multi_mac_tree_gemv_tb;
     initial begin
         if ($test$plusargs("dump_vcd")) begin
             $dumpfile($sformatf(
-                "build/vcd/bf16_multi_mac_tree_gemv_p%0d_%0dps.vcd",
-                PIPELINE_STAGES, int'(clock_half_period * 2000.0)));
+                "build/vcd/bf16_multi_mac_tree_gemv_p%0da%0d_%0dps.vcd",
+                PIPELINE_STAGES, ACCUMULATE_STAGES,
+                int'(clock_half_period * 2000.0)));
             $dumpvars(0, dut);
         end
     end
@@ -161,8 +170,8 @@ module bf16_multi_mac_tree_gemv_tb;
         @(negedge clk);
         enable = 1'b0;
 
-        // Drain the product pipeline before reading the accumulators.
-        repeat (PIPELINE_STAGES + 1) @(posedge clk);
+        // Drain the product and accumulate pipelines before reading out.
+        repeat (LATENCY + 1) @(posedge clk);
         @(negedge clk);
 
         for (int j = 0; j < ACCUMULATORS; j++) begin

@@ -26,6 +26,16 @@ module bf16_multi_mac_tree #(
     parameter int unsigned ACCUMULATORS = 4,
     parameter int unsigned REDUCTION_GUARD_BITS = 4,
     parameter int unsigned PIPELINE_STAGES = 0,
+    // Pipeline depth of the accumulate read-modify-write loop. Legal because
+    // accumulators are selected round-robin, so an accumulator is not revisited
+    // for ACCUMULATORS cycles:
+    //   0 - bank read, FP32 add and write-back in one cycle,
+    //   1 - registered bank read, then the full FP32 adder,
+    //   2 - registered bank read, then FP32 align, then normalize and round.
+    parameter int unsigned ACCUMULATE_STAGES = 0,
+    parameter int unsigned CONTROL_DEPTH = PIPELINE_STAGES + ACCUMULATE_STAGES,
+    parameter int unsigned READ_TAP = PIPELINE_STAGES,
+    parameter int unsigned WRITE_TAP = PIPELINE_STAGES + ACCUMULATE_STAGES,
     parameter int unsigned SELECT_WIDTH =
         (ACCUMULATORS <= 1) ? 1 : $clog2(ACCUMULATORS),
     parameter int unsigned TREE_LEVELS =
@@ -50,8 +60,26 @@ module bf16_multi_mac_tree #(
     logic [31:0] reduced_product_sum;
     logic [31:0] stage2_reduced_product_sum;
     logic [31:0] accumulator_bank [0:ACCUMULATORS-1];
+    logic [31:0] bank_read;
     logic [31:0] selected_accumulator;
+    logic [31:0] accumulate_operand;
     logic [31:0] next_accumulator;
+
+    // ctrl_*_q[d] is the control delayed by d+1 cycles. Tap 0 is the live input,
+    // so taps are read through read_*/mid_*/accumulate_* below.
+    localparam int unsigned CHAIN_DEPTH =
+        (CONTROL_DEPTH == 0) ? 1 : CONTROL_DEPTH;
+    // Index of the tap one cycle past the bank read, used only by the split
+    // adder. Clamped so the array reference stays in range otherwise.
+    localparam int unsigned MID_INDEX =
+        (ACCUMULATE_STAGES >= 2) ? READ_TAP : 0;
+
+    logic                    ctrl_valid_q [0:CHAIN_DEPTH-1];
+    logic [SELECT_WIDTH-1:0] ctrl_sel_q   [0:CHAIN_DEPTH-1];
+
+    logic                    read_valid;
+    logic [SELECT_WIDTH-1:0] read_select;
+    logic                    mid_valid;
 
     logic positive_infinity;
     logic negative_infinity;
@@ -137,59 +165,156 @@ module bf16_multi_mac_tree #(
         end
     endgenerate
 
-    // enable and the destination selector travel with the product data so the
-    // accumulate stage commits the operation that produced its operand.
+    // enable and the destination selector travel with the product data so each
+    // stage acts on the operation that produced its operand. ctrl_*[k] is the
+    // control delayed by exactly k cycles, so the read and write stages simply
+    // take different taps of the same chain.
     generate
-        if (PIPELINE_STAGES == 0) begin : g_control_direct
-            always_comb begin
-                accumulate_enable = enable;
-                accumulate_select = accumulator_select;
-            end
-        end else begin : g_control_delayed
-            logic                    enable_delay [0:PIPELINE_STAGES-1];
-            logic [SELECT_WIDTH-1:0] select_delay [0:PIPELINE_STAGES-1];
-
+        if (CONTROL_DEPTH > 0) begin : g_control_delay
             always_ff @(posedge clk) begin
                 if (reset) begin
-                    for (int unsigned d = 0; d < PIPELINE_STAGES; d++) begin
-                        enable_delay[d] <= 1'b0;
-                        select_delay[d] <= '0;
+                    for (int unsigned d = 0; d < CONTROL_DEPTH; d++) begin
+                        ctrl_valid_q[d] <= 1'b0;
+                        ctrl_sel_q[d]   <= '0;
                     end
                 end else begin
-                    enable_delay[0] <= enable;
-                    select_delay[0] <= accumulator_select;
-                    for (int unsigned d = 1; d < PIPELINE_STAGES; d++) begin
-                        enable_delay[d] <= enable_delay[d-1];
-                        select_delay[d] <= select_delay[d-1];
+                    ctrl_valid_q[0] <= enable;
+                    ctrl_sel_q[0]   <= accumulator_select;
+                    for (int unsigned d = 1; d < CONTROL_DEPTH; d++) begin
+                        ctrl_valid_q[d] <= ctrl_valid_q[d-1];
+                        ctrl_sel_q[d]   <= ctrl_sel_q[d-1];
                     end
                 end
             end
-
+        end else begin : g_control_unused
             always_comb begin
-                accumulate_enable = enable_delay[PIPELINE_STAGES-1];
-                accumulate_select = select_delay[PIPELINE_STAGES-1];
+                ctrl_valid_q[0] = 1'b0;
+                ctrl_sel_q[0]   = '0;
             end
         end
     endgenerate
 
     always_comb begin
-        selected_accumulator = 32'b0;
-        if (accumulate_select < ACCUMULATORS)
-            selected_accumulator = accumulator_bank[accumulate_select];
+        read_valid  = (READ_TAP == 0) ? enable : ctrl_valid_q[READ_TAP-1];
+        read_select = (READ_TAP == 0) ? accumulator_select
+                                     : ctrl_sel_q[READ_TAP-1];
+        mid_valid   = ctrl_valid_q[MID_INDEX];
 
-        // Readout is unpipelined so the selected accumulator can be observed
-        // directly.
+        accumulate_enable = (WRITE_TAP == 0) ? enable
+                                             : ctrl_valid_q[WRITE_TAP-1];
+        accumulate_select = (WRITE_TAP == 0) ? accumulator_select
+                                             : ctrl_sel_q[WRITE_TAP-1];
+    end
+
+    // Readout is unpipelined so the selected accumulator can be observed
+    // directly.
+    always_comb begin
         accumulator = 32'b0;
         if (accumulator_select < ACCUMULATORS)
             accumulator = accumulator_bank[accumulator_select];
     end
 
-    // Only this final feedback operation uses the full FP32 adder.
-    fp32_adder accumulator_adder (
-        .a   (selected_accumulator),
-        .b   (stage2_reduced_product_sum),
-        .sum (next_accumulator)
-    );
+    // Accumulate stage. Round-robin selection means an accumulator is not
+    // revisited for ACCUMULATORS cycles, so this read-modify-write loop carries
+    // no read-after-write hazard and can be cut into short pipeline segments.
+    generate
+        if (ACCUMULATE_STAGES == 0) begin : g_accumulate_flat
+            // Bank read, FP32 add and write-back all in the committing cycle.
+            always_comb begin
+                selected_accumulator = 32'b0;
+                if (accumulate_select < ACCUMULATORS)
+                    selected_accumulator =
+                        accumulator_bank[accumulate_select];
+            end
+
+            always_comb accumulate_operand = stage2_reduced_product_sum;
+
+            fp32_adder accumulator_adder (
+                .a   (selected_accumulator),
+                .b   (accumulate_operand),
+                .sum (next_accumulator)
+            );
+        end else begin : g_accumulate_pipelined
+            // The read address is a tap of the control chain, so the bank mux
+            // gets a cycle of its own. The tree result is held alongside it so
+            // both adder operands arrive in the same cycle.
+            always_comb begin
+                bank_read = 32'b0;
+                if (read_select < ACCUMULATORS)
+                    bank_read = accumulator_bank[read_select];
+            end
+
+            always_ff @(posedge clk) begin
+                if (reset) begin
+                    selected_accumulator <= 32'b0;
+                    accumulate_operand   <= 32'b0;
+                end else if (read_valid) begin
+                    selected_accumulator <= bank_read;
+                    accumulate_operand   <= stage2_reduced_product_sum;
+                end
+            end
+
+            if (ACCUMULATE_STAGES == 1) begin : g_adder_flat
+                fp32_adder accumulator_adder (
+                    .a   (selected_accumulator),
+                    .b   (accumulate_operand),
+                    .sum (next_accumulator)
+                );
+            end else begin : g_adder_split
+                // Align in one cycle, add/normalize/round in the next.
+                logic        add_special_valid, add_special_valid_q;
+                logic [31:0] add_special_sum,   add_special_sum_q;
+                logic        add_sign,          add_sign_q;
+                logic [7:0]  add_exp,           add_exp_q;
+                logic [26:0] add_large_ext,     add_large_ext_q;
+                logic [26:0] add_aligned_small, add_aligned_small_q;
+                logic        add_not_sub,       add_not_sub_q;
+
+                fp32_adder_align align_half (
+                    .a             (selected_accumulator),
+                    .b             (accumulate_operand),
+                    .special_valid (add_special_valid),
+                    .special_sum   (add_special_sum),
+                    .result_sign   (add_sign),
+                    .result_exp    (add_exp),
+                    .large_ext     (add_large_ext),
+                    .aligned_small (add_aligned_small),
+                    .add_not_sub   (add_not_sub)
+                );
+
+                always_ff @(posedge clk) begin
+                    if (reset) begin
+                        add_special_valid_q <= 1'b0;
+                        add_special_sum_q   <= 32'b0;
+                        add_sign_q          <= 1'b0;
+                        add_exp_q           <= 8'b0;
+                        add_large_ext_q     <= 27'b0;
+                        add_aligned_small_q <= 27'b0;
+                        add_not_sub_q       <= 1'b0;
+                    end else if (mid_valid) begin
+                        add_special_valid_q <= add_special_valid;
+                        add_special_sum_q   <= add_special_sum;
+                        add_sign_q          <= add_sign;
+                        add_exp_q           <= add_exp;
+                        add_large_ext_q     <= add_large_ext;
+                        add_aligned_small_q <= add_aligned_small;
+                        add_not_sub_q       <= add_not_sub;
+                    end
+                end
+
+                fp32_adder_normalize normalize_half (
+                    .special_valid (add_special_valid_q),
+                    .special_sum   (add_special_sum_q),
+                    .result_sign   (add_sign_q),
+                    .result_exp    (add_exp_q),
+                    .large_ext     (add_large_ext_q),
+                    .aligned_small (add_aligned_small_q),
+                    .add_not_sub   (add_not_sub_q),
+                    .sum           (next_accumulator)
+                );
+            end
+        end
+    endgenerate
 
     always_ff @(posedge clk) begin
         if (reset || clear) begin
@@ -201,4 +326,22 @@ module bf16_multi_mac_tree #(
             accumulator_bank[accumulate_select] <= next_accumulator;
         end
     end
+
+`ifndef SYNTHESIS
+    // Issue contract for a pipelined accumulate loop: an accumulator that is
+    // still in flight must not be re-issued, or its read would miss the
+    // in-flight update. Round-robin selection over ACCUMULATORS entries
+    // satisfies this for any ACCUMULATE_STAGES < ACCUMULATORS.
+    always_ff @(posedge clk) begin
+        if (!reset && enable) begin
+            for (int unsigned d = 0; d < CONTROL_DEPTH; d++) begin
+                if ((d + 1) > READ_TAP && ctrl_valid_q[d] &&
+                    ctrl_sel_q[d] == accumulator_select)
+                    $error({"bf16_multi_mac_tree: accumulator %0d re-issued ",
+                            "while still in flight (%0d cycles behind)"},
+                           accumulator_select, d + 1);
+            end
+        end
+    end
+`endif
 endmodule

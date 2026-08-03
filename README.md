@@ -78,77 +78,87 @@ SDC files land under their respective `build/synth*` directories. Use
 CLN4P, `tt_0p75v_25c_typical`, `MULTIPLIERS=8`, `ACCUMULATORS=32`,
 `REDUCTION_GUARD_BITS=4`, zero wireload. Power is activity driven from the
 matched-frequency GEMV VCD. One OP is one BF16 MAC, so a cycle retires 8 OPs.
+Build with `make synth-tree-<point> TREE_ACC=<0|1|2>`; results land in
+`build/synth_tree_<point>_a<TREE_ACC>`.
 
-`bf16_multi_mac_tree` — one tree, output-side accumulator mux, single-cycle
-datapath deepened with pipeline stages:
+### The problem
 
-| Point | Period | Freq | Stages | Cells | Area (um2) | Power (mW) | pJ/cycle | pJ/OP | Slack |
-|---|---|---|---|---|---|---|---|---|---|
-| 1/4 | 2.667 ns | 375 MHz | 0 | 8722 | 588.5 | 1.378 | 3.68 | 0.459 | 0 ps |
-| 1/2 | 1.333 ns | 750 MHz | 1 | 9352 | 653.4 | 3.035 | 4.05 | 0.506 | 0 ps |
-| 1x | 0.667 ns | 1.5 GHz | 2 | 12994 | 811.2 | 6.806 | 4.54 | 0.567 | -67 ps |
+At 1x the design missed timing by 67 ps on this path:
 
-`bf16_dual_mac_tree` — two replicated trees, input-side lane demux, each lane a
-declared 2-cycle multicycle path (`LANE_CYCLES=2`, lanes own 16 accumulators
-each):
+```
+select_delay_reg -> 32:1 accumulator read mux -> fp32_adder -> accumulator_bank_reg
+```
 
-| Point | Period | Freq | Stages | Cells | Area (um2) | Power (mW) | pJ/cycle | pJ/OP | Slack |
-|---|---|---|---|---|---|---|---|---|---|
-| 1/4 | 2.667 ns | 375 MHz | 0 | 14731 | 1051.4 | 1.896 | 5.06 | 0.632 | +42 ps |
-| 1/2 | 1.333 ns | 750 MHz | 0 | 17987 | 1135.5 | 4.215 | 5.62 | 0.702 | 0 ps |
-| 1x | 0.667 ns | 1.5 GHz | 1 | 23056 | 1366.6 | 9.265 | 6.18 | 0.772 | -26 ps |
+That is the whole accumulate read-modify-write in one cycle. It normally cannot
+be pipelined, because it is a feedback loop: the next operation might target the
+same accumulator, so any register inside the loop creates a read-after-write
+hazard.
 
-`bf16_dual_mac_tree` with `ACCUMULATE_STAGES=1` — as above, plus the accumulate
-read-modify-write split into a registered bank read and a separate add plus
-write-back. The read is overlapped with the last cycle of the lane's tree
-segment, so latency and throughput are unchanged:
+### The fix: exploit round-robin selection
 
-| Point | Period | Freq | Stages | Cells | Area (um2) | Power (mW) | pJ/cycle | pJ/OP | Slack |
-|---|---|---|---|---|---|---|---|---|---|
-| 1/4 | 2.667 ns | 375 MHz | 0 | 14871 | 1064.9 | 1.948 | 5.20 | 0.649 | +262 ps |
-| 1/2 | 1.333 ns | 750 MHz | 0 | 17982 | 1148.1 | 4.295 | 5.73 | 0.716 | 0 ps |
-| 1x | 0.667 ns | 1.5 GHz | 1 | 21221 | 1293.9 | 9.009 | 6.01 | 0.751 | 0 ps |
+Accumulators are selected in a fixed order `0,1,2,...,31`, so an accumulator is
+not revisited for 32 cycles. That removes the hazard and lets the loop be cut
+into short segments with no forwarding and no multicycle constraints.
+`ACCUMULATE_STAGES` controls the depth:
 
-The first dual-lane experiment does not pay off on its own: it costs 1.7-1.8x
-the area and 1.36-1.38x the energy per OP, and it still misses 1.5 GHz. The
-reason is that the relaxed path was never the binding one. In all three
-`ACCUMULATE_STAGES=0` builds the critical path is
-`issue_sel_reg -> bank read mux -> fp32_adder -> bank_reg`, the single-cycle
-accumulate read-modify-write loop. Splitting the bank into two 16-entry halves
-only shortens that mux by one level, so the 1x point still misses (-26 ps,
-versus -67 ps for the single tree), while the multicycle relaxation is spent on
-a multiply/align/reduce cone that had slack to spare.
+- `0` - bank read, FP32 add and write-back in one cycle (original).
+- `1` - registered bank read, then the full FP32 adder. The read address is a
+  tap of the control chain, so the bank mux gets a cycle to itself.
+- `2` - also splits `fp32_adder` into `fp32_adder_align` (decompose, special
+  values, magnitude compare, alignment) and `fp32_adder_normalize` (add/sub,
+  cancellation normalize, round).
 
-Pipelining the accumulate loop fixes exactly that. With `ACCUMULATE_STAGES=1`
-the limiter becomes `selected_accumulator_reg -> fp32_adder -> bank_reg`, and:
+Latency becomes `PIPELINE_STAGES + ACCUMULATE_STAGES` cycles; throughput stays
+one operation per cycle. The contract is asserted in RTL: an accumulator still
+in flight must not be re-issued.
 
-- the 1x point closes timing at 0 ps, making it the only 1.5 GHz build of the
-  three that meets its constraint (single tree -67 ps, dual v1 -26 ps);
-- it is also smaller and lower power than dual v1 at 1x (1293.9 vs 1366.6 um2,
-  9.009 vs 9.265 mW), because Genus no longer has to over-size the accumulate
-  cone chasing an unreachable target;
-- the 1/4 point gains 262 ps of slack over the 42 ps of dual v1, i.e. headroom
-  for a further frequency push or a voltage reduction.
+### Results
 
-It still does not beat the single tree on absolute area or energy per OP: 1.59x
-area and 1.32x pJ/OP at 1x. Replicating the trees doubles leakage and clock
-power, and the operand hold registers add 2 x 8 x 32 bits of flops that toggle
-at the full issue rate, so halving each lane's activity does not halve its
-energy. The honest conclusion is that the input-side mux buys timing closure at
-1.5 GHz, not efficiency; if the goal is pJ/OP, the single tree at a lower
-frequency point remains the better design.
+`ACCUMULATE_STAGES=2`:
 
-The dual-lane design also imposes an issue contract the single tree does not:
-consecutive operations must alternate accumulator halves, so drivers have to
-interleave their output-column order. `bf16_dual_mac_tree_gemv_tb` visits
-columns as 0, 16, 1, 17, ... to satisfy it, and the RTL asserts it.
+| Point | Period | Freq | Tree stages | Cells | Area (um2) | Power (mW) | pJ/OP | Slack |
+|---|---|---|---|---|---|---|---|---|
+| 1/4 | 2.667 ns | 375 MHz | 0 | 8467 | 624.1 | 1.466 | 0.489 | +15 ps |
+| 1/2 | 1.333 ns | 750 MHz | 1 | 9354 | 667.9 | 3.065 | 0.511 | +1 ps |
+| 1x | 0.667 ns | 1.5 GHz | 2 | 11413 | 765.4 | 6.402 | 0.534 | 0 ps |
 
-Reproduce with `make synth-bf16-multi-mac-tree`,
-`make synth-bf16-dual-mac-tree` (single-cycle accumulate) and
-`make synth-bf16-dual-mac-tree-pipelined` (registered bank read); re-annotate
-power on existing netlists with `make power-tree`, `make power-dual` and
-`make power-dualp`. Note that the Genus pool here allows only two concurrent
-seats, so run at most two synthesis points in parallel.
+1x comparison against `ACCUMULATE_STAGES=0` built from the same RTL:
+
+| 1x variant | Cells | Area (um2) | Power (mW) | pJ/OP | Slack |
+|---|---|---|---|---|---|
+| flat accumulate | 13303 | 828.7 | 6.500 | 0.542 | -48 ps |
+| pipelined accumulate | 11413 | 765.4 | 6.402 | 0.534 | **0 ps** |
+
+The 1x point closes, and it does so while getting **smaller and lower power**:
+7.6% less area and 1.5% less energy per OP. Relieving the timing pressure lets
+Genus drop the upsized cells and duplicated logic it was using to chase an
+unreachable target, which more than pays for the ~100 bits of added pipeline
+register. The critical path is now
+`add_aligned_small_q_reg -> fp32_adder_normalize -> accumulator_bank_reg`.
+
+At the slower points the pipelining is a small net cost (1/4: 624.1 um2 and
+0.489 pJ/OP against 588.5 and 0.459 pre-refactor), because the extra registers
+buy timing that was not needed there. The recommendation is therefore
+`ACCUMULATE_STAGES=2` at 1x and `0` at the slower points.
+
+Two caveats on the numbers:
+
+- Splitting `fp32_adder` into two submodules changes the hierarchy Genus sees,
+  which shifts its optimization result. The same-RTL 1x flat point measures
+  828.7 um2 / -48 ps, against 811.2 um2 / -67 ps before the split. The 1x table
+  above therefore compares same-RTL builds; the 1/4 and 1/2 figures quoted for
+  comparison (588.5 and 653.4 um2) are pre-refactor and are reference only.
+- The Genus pool here allows only two concurrent seats, so run at most two
+  synthesis points in parallel.
+
+### Rejected alternative
+
+An earlier experiment (`bf16_dual_mac_tree`, removed) moved the accumulator mux
+to the input: two replicated trees, each owning 16 accumulators and given a
+2-cycle multicycle path. It cost 1.6-1.8x the area and 1.3x the energy per OP
+and still did not close 1x, because the multicycle relaxation was spent on the
+multiply/align/reduce cone, which had slack, while the accumulate loop remained
+the limiter. Pipelining that loop directly is the cheaper and effective fix.
 
 ## Clean generated files
 

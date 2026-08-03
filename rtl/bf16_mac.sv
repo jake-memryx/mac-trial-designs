@@ -60,23 +60,31 @@ module bf16_multiplier (
 endmodule
 
 
-// Combinational FP32 adder. Rounding mode is round-to-nearest, ties-to-even.
-// Subnormal inputs and underflowed outputs are flushed to signed zero.
-module fp32_adder (
+
+
+// FP32 add, first half: decompose, resolve special values, order the operands
+// by magnitude and align the smaller significand into the larger one's scale.
+//
+// Special-value results are resolved here and passed through on special_sum so
+// the second half never has to look at the raw inputs. When special_valid is
+// set the remaining outputs are don't-care.
+module fp32_adder_align (
     input  logic [31:0] a,
     input  logic [31:0] b,
-    output logic [31:0] sum
+    output logic        special_valid,
+    output logic [31:0] special_sum,
+    output logic        result_sign,
+    output logic [7:0]  result_exp,
+    output logic [26:0] large_ext,
+    output logic [26:0] aligned_small,
+    output logic        add_not_sub
 );
-    logic        sign_a, sign_b, sign_large, result_sign;
-    logic [7:0]  exp_a, exp_b, exp_large, exp_small, result_exp;
+    logic        sign_a, sign_b, sign_large;
+    logic [7:0]  exp_a, exp_b, exp_large, exp_small;
     logic [22:0] frac_a, frac_b;
     logic [23:0] sig_a, sig_b, sig_large, sig_small;
-    logic [26:0] large_ext, small_ext, aligned_small, normalized;
-    logic [27:0] add_result;
-    logic [26:0] sub_result;
-    logic [24:0] rounded_sig;
+    logic [26:0] small_ext;
     integer      shift_amount;
-    integer      i;
 
     function automatic logic [26:0] shift_right_jam(
         input logic [26:0] value,
@@ -111,38 +119,43 @@ module fp32_adder (
         sig_a         = {1'b1, frac_a};
         sig_b         = {1'b1, frac_b};
         sign_large    = 1'b0;
-        result_sign   = 1'b0;
         exp_large     = 8'b0;
         exp_small     = 8'b0;
-        result_exp    = 8'b0;
         sig_large     = 24'b0;
         sig_small     = 24'b0;
-        large_ext     = 27'b0;
         small_ext     = 27'b0;
-        aligned_small = 27'b0;
-        normalized    = 27'b0;
-        add_result    = 28'b0;
-        sub_result    = 27'b0;
-        rounded_sig   = 25'b0;
         shift_amount  = 0;
-        sum           = 32'b0;
+
+        special_valid = 1'b0;
+        special_sum   = 32'b0;
+        result_sign   = 1'b0;
+        result_exp    = 8'b0;
+        large_ext     = 27'b0;
+        aligned_small = 27'b0;
+        add_not_sub   = 1'b0;
 
         // Quiet NaN propagation and invalid infinity addition.
         if ((exp_a == 8'hff && frac_a != 0) ||
             (exp_b == 8'hff && frac_b != 0) ||
             (exp_a == 8'hff && exp_b == 8'hff && sign_a != sign_b)) begin
-            sum = 32'h7fc00000;
+            special_valid = 1'b1;
+            special_sum   = 32'h7fc00000;
         end else if (exp_a == 8'hff) begin
-            sum = {sign_a, 8'hff, 23'b0};
+            special_valid = 1'b1;
+            special_sum   = {sign_a, 8'hff, 23'b0};
         end else if (exp_b == 8'hff) begin
-            sum = {sign_b, 8'hff, 23'b0};
+            special_valid = 1'b1;
+            special_sum   = {sign_b, 8'hff, 23'b0};
         end else if (exp_a == 0 && exp_b == 0) begin
             // Includes flushed subnormal inputs.
-            sum = {(sign_a & sign_b), 31'b0};
+            special_valid = 1'b1;
+            special_sum   = {(sign_a & sign_b), 31'b0};
         end else if (exp_a == 0) begin
-            sum = b;
+            special_valid = 1'b1;
+            special_sum   = b;
         end else if (exp_b == 0) begin
-            sum = a;
+            special_valid = 1'b1;
+            special_sum   = a;
         end else begin
             // Put the larger-magnitude operand on the unshifted side.
             if ({exp_a, frac_a} >= {exp_b, frac_b}) begin
@@ -165,16 +178,52 @@ module fp32_adder (
             small_ext     = {sig_small, 3'b000};
             shift_amount  = exp_large - exp_small;
             aligned_small = shift_right_jam(small_ext, shift_amount);
+            add_not_sub   = (sign_a == sign_b);
+        end
+    end
+endmodule
 
-            if (sign_a == sign_b) begin
+
+// FP32 add, second half: add or subtract the aligned significands, renormalize
+// (carry-out for addition, cancellation for subtraction), then round once with
+// round-to-nearest, ties-to-even.
+module fp32_adder_normalize (
+    input  logic        special_valid,
+    input  logic [31:0] special_sum,
+    input  logic        result_sign,
+    input  logic [7:0]  result_exp,
+    input  logic [26:0] large_ext,
+    input  logic [26:0] aligned_small,
+    input  logic        add_not_sub,
+    output logic [31:0] sum
+);
+    logic [26:0] normalized;
+    logic [27:0] add_result;
+    logic [26:0] sub_result;
+    logic [24:0] rounded_sig;
+    logic [7:0]  working_exp;
+    integer      i;
+
+    always_comb begin
+        normalized  = 27'b0;
+        add_result  = 28'b0;
+        sub_result  = 27'b0;
+        rounded_sig = 25'b0;
+        working_exp = result_exp;
+        sum         = 32'b0;
+
+        if (special_valid) begin
+            sum = special_sum;
+        end else begin
+            if (add_not_sub) begin
                 add_result = {1'b0, large_ext} + {1'b0, aligned_small};
                 if (add_result[27]) begin
                     normalized    = add_result[27:1];
                     normalized[0] = normalized[0] | add_result[0];
-                    if (result_exp == 8'hfe)
-                        result_exp = 8'hff;
+                    if (working_exp == 8'hfe)
+                        working_exp = 8'hff;
                     else
-                        result_exp = result_exp + 1'b1;
+                        working_exp = working_exp + 1'b1;
                 end else begin
                     normalized = add_result[26:0];
                 end
@@ -184,17 +233,18 @@ module fp32_adder (
                 // Cancellation normalization. Falling below the normal range
                 // flushes the result to zero.
                 for (i = 0; i < 26; i = i + 1) begin
-                    if (!normalized[26] && normalized != 0 && result_exp > 1) begin
-                        normalized = normalized << 1;
-                        result_exp = result_exp - 1'b1;
+                    if (!normalized[26] && normalized != 0 &&
+                        working_exp > 1) begin
+                        normalized  = normalized << 1;
+                        working_exp = working_exp - 1'b1;
                     end
                 end
             end
 
             if (normalized == 0 ||
-                (result_exp == 1 && !normalized[26])) begin
+                (working_exp == 1 && !normalized[26])) begin
                 sum = {result_sign, 31'b0};
-            end else if (result_exp == 8'hff) begin
+            end else if (working_exp == 8'hff) begin
                 sum = {result_sign, 8'hff, 23'b0};
             end else begin
                 // Guard, round, and sticky bits implement ties-to-even.
@@ -203,17 +253,58 @@ module fp32_adder (
                                (normalized[1] || normalized[0] ||
                                 normalized[3]));
                 if (rounded_sig[24]) begin
-                    if (result_exp == 8'hfe)
+                    if (working_exp == 8'hfe)
                         sum = {result_sign, 8'hff, 23'b0};
                     else
-                        sum = {result_sign, result_exp + 1'b1,
+                        sum = {result_sign, working_exp + 1'b1,
                                rounded_sig[23:1]};
                 end else begin
-                    sum = {result_sign, result_exp, rounded_sig[22:0]};
+                    sum = {result_sign, working_exp, rounded_sig[22:0]};
                 end
             end
         end
     end
+endmodule
+
+
+// Combinational FP32 adder. Rounding mode is round-to-nearest, ties-to-even.
+// Subnormal inputs and underflowed outputs are flushed to signed zero. This is
+// the two halves above wired back-to-back with no register between them.
+module fp32_adder (
+    input  logic [31:0] a,
+    input  logic [31:0] b,
+    output logic [31:0] sum
+);
+    logic        special_valid;
+    logic [31:0] special_sum;
+    logic        result_sign;
+    logic [7:0]  result_exp;
+    logic [26:0] large_ext;
+    logic [26:0] aligned_small;
+    logic        add_not_sub;
+
+    fp32_adder_align align_half (
+        .a             (a),
+        .b             (b),
+        .special_valid (special_valid),
+        .special_sum   (special_sum),
+        .result_sign   (result_sign),
+        .result_exp    (result_exp),
+        .large_ext     (large_ext),
+        .aligned_small (aligned_small),
+        .add_not_sub   (add_not_sub)
+    );
+
+    fp32_adder_normalize normalize_half (
+        .special_valid (special_valid),
+        .special_sum   (special_sum),
+        .result_sign   (result_sign),
+        .result_exp    (result_exp),
+        .large_ext     (large_ext),
+        .aligned_small (aligned_small),
+        .add_not_sub   (add_not_sub),
+        .sum           (sum)
+    );
 endmodule
 
 
