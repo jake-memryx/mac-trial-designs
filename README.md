@@ -73,6 +73,83 @@ optimizes against a 1.5 GHz (`0.666667 ns`) clock. Reports, mapped netlists, and
 SDC files land under their respective `build/synth*` directories. Use
 `make synth-bf16-mac` or `make synth-bf16-mama` for those designs.
 
+## Tree-MAC synthesis sweep results
+
+CLN4P, `tt_0p75v_25c_typical`, `MULTIPLIERS=8`, `ACCUMULATORS=32`,
+`REDUCTION_GUARD_BITS=4`, zero wireload. Power is activity driven from the
+matched-frequency GEMV VCD. One OP is one BF16 MAC, so a cycle retires 8 OPs.
+
+`bf16_multi_mac_tree` — one tree, output-side accumulator mux, single-cycle
+datapath deepened with pipeline stages:
+
+| Point | Period | Freq | Stages | Cells | Area (um2) | Power (mW) | pJ/cycle | pJ/OP | Slack |
+|---|---|---|---|---|---|---|---|---|---|
+| 1/4 | 2.667 ns | 375 MHz | 0 | 8722 | 588.5 | 1.378 | 3.68 | 0.459 | 0 ps |
+| 1/2 | 1.333 ns | 750 MHz | 1 | 9352 | 653.4 | 3.035 | 4.05 | 0.506 | 0 ps |
+| 1x | 0.667 ns | 1.5 GHz | 2 | 12994 | 811.2 | 6.806 | 4.54 | 0.567 | -67 ps |
+
+`bf16_dual_mac_tree` — two replicated trees, input-side lane demux, each lane a
+declared 2-cycle multicycle path (`LANE_CYCLES=2`, lanes own 16 accumulators
+each):
+
+| Point | Period | Freq | Stages | Cells | Area (um2) | Power (mW) | pJ/cycle | pJ/OP | Slack |
+|---|---|---|---|---|---|---|---|---|---|
+| 1/4 | 2.667 ns | 375 MHz | 0 | 14731 | 1051.4 | 1.896 | 5.06 | 0.632 | +42 ps |
+| 1/2 | 1.333 ns | 750 MHz | 0 | 17987 | 1135.5 | 4.215 | 5.62 | 0.702 | 0 ps |
+| 1x | 0.667 ns | 1.5 GHz | 1 | 23056 | 1366.6 | 9.265 | 6.18 | 0.772 | -26 ps |
+
+`bf16_dual_mac_tree` with `ACCUMULATE_STAGES=1` — as above, plus the accumulate
+read-modify-write split into a registered bank read and a separate add plus
+write-back. The read is overlapped with the last cycle of the lane's tree
+segment, so latency and throughput are unchanged:
+
+| Point | Period | Freq | Stages | Cells | Area (um2) | Power (mW) | pJ/cycle | pJ/OP | Slack |
+|---|---|---|---|---|---|---|---|---|---|
+| 1/4 | 2.667 ns | 375 MHz | 0 | 14871 | 1064.9 | 1.948 | 5.20 | 0.649 | +262 ps |
+| 1/2 | 1.333 ns | 750 MHz | 0 | 17982 | 1148.1 | 4.295 | 5.73 | 0.716 | 0 ps |
+| 1x | 0.667 ns | 1.5 GHz | 1 | 21221 | 1293.9 | 9.009 | 6.01 | 0.751 | 0 ps |
+
+The first dual-lane experiment does not pay off on its own: it costs 1.7-1.8x
+the area and 1.36-1.38x the energy per OP, and it still misses 1.5 GHz. The
+reason is that the relaxed path was never the binding one. In all three
+`ACCUMULATE_STAGES=0` builds the critical path is
+`issue_sel_reg -> bank read mux -> fp32_adder -> bank_reg`, the single-cycle
+accumulate read-modify-write loop. Splitting the bank into two 16-entry halves
+only shortens that mux by one level, so the 1x point still misses (-26 ps,
+versus -67 ps for the single tree), while the multicycle relaxation is spent on
+a multiply/align/reduce cone that had slack to spare.
+
+Pipelining the accumulate loop fixes exactly that. With `ACCUMULATE_STAGES=1`
+the limiter becomes `selected_accumulator_reg -> fp32_adder -> bank_reg`, and:
+
+- the 1x point closes timing at 0 ps, making it the only 1.5 GHz build of the
+  three that meets its constraint (single tree -67 ps, dual v1 -26 ps);
+- it is also smaller and lower power than dual v1 at 1x (1293.9 vs 1366.6 um2,
+  9.009 vs 9.265 mW), because Genus no longer has to over-size the accumulate
+  cone chasing an unreachable target;
+- the 1/4 point gains 262 ps of slack over the 42 ps of dual v1, i.e. headroom
+  for a further frequency push or a voltage reduction.
+
+It still does not beat the single tree on absolute area or energy per OP: 1.59x
+area and 1.32x pJ/OP at 1x. Replicating the trees doubles leakage and clock
+power, and the operand hold registers add 2 x 8 x 32 bits of flops that toggle
+at the full issue rate, so halving each lane's activity does not halve its
+energy. The honest conclusion is that the input-side mux buys timing closure at
+1.5 GHz, not efficiency; if the goal is pJ/OP, the single tree at a lower
+frequency point remains the better design.
+
+The dual-lane design also imposes an issue contract the single tree does not:
+consecutive operations must alternate accumulator halves, so drivers have to
+interleave their output-column order. `bf16_dual_mac_tree_gemv_tb` visits
+columns as 0, 16, 1, 17, ... to satisfy it, and the RTL asserts it.
+
+Reproduce with `make synth-bf16-multi-mac-tree`,
+`make synth-bf16-dual-mac-tree` (single-cycle accumulate) and
+`make synth-bf16-dual-mac-tree-pipelined` (registered bank read); re-annotate
+power on existing netlists with `make power-tree`, `make power-dual` and
+`make power-dualp`. Note that the Genus pool here allows only two concurrent
+seats, so run at most two synthesis points in parallel.
+
 ## Clean generated files
 
 ```sh

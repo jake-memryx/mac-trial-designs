@@ -5,18 +5,34 @@
 `define PIPELINE_STAGES 0
 `endif
 
-// C[32] = A[1024] x B[1024][32] on a tree MAC with 8 multipliers and 32
-// accumulators. Eight A elements are held stationary while 32 cycles walk the
-// output columns: cycle j reduces the eight products A[k+i]*B[k+i][j] and folds
-// the result into accumulator j. Each group of eight A elements therefore takes
-// 32 cycles, and 128 groups cover the full 1024-deep dot products.
-module bf16_multi_mac_tree_gemv_tb;
+// Override at compile time with -define LANE_CYCLES=<1|2>.
+`ifndef LANE_CYCLES
+`define LANE_CYCLES 2
+`endif
+
+// Override at compile time with -define ACCUMULATE_STAGES=<0|1>.
+`ifndef ACCUMULATE_STAGES
+`define ACCUMULATE_STAGES 1
+`endif
+
+// C[32] = A[1024] x B[1024][32] on the dual-lane tree MAC with 8 multipliers
+// and 32 accumulators. Eight A elements are held stationary while 32 cycles
+// walk the output columns, exactly as in the single-tree GEMV testbench, with
+// one change: the columns are visited in interleaved order (0, 16, 1, 17, ...)
+// so consecutive cycles alternate between the two internal lanes. GEMV columns
+// are independent, so the reference result is unaffected.
+module bf16_dual_mac_tree_gemv_tb;
     localparam int unsigned MULTIPLIERS  = 8;
     localparam int unsigned ACCUMULATORS = 32;
+    localparam int unsigned LANES        = 2;
+    localparam int unsigned LANE_DEPTH   = ACCUMULATORS / LANES;
     localparam int unsigned SELECT_WIDTH = $clog2(ACCUMULATORS);
     localparam int unsigned DEPTH        = 1024;
     localparam int unsigned GROUPS       = DEPTH / MULTIPLIERS;
     localparam int unsigned PIPELINE_STAGES = `PIPELINE_STAGES;
+    localparam int unsigned LANE_CYCLES     = `LANE_CYCLES;
+    localparam int unsigned ACCUMULATE_STAGES = `ACCUMULATE_STAGES;
+    localparam int unsigned LATENCY = LANE_CYCLES * (PIPELINE_STAGES + 1);
     localparam real         SIGMA        = 10.0;
     localparam real         TOLERANCE    = 1.0e-3;
 
@@ -35,12 +51,20 @@ module bf16_multi_mac_tree_gemv_tb;
     real         magnitude [0:ACCUMULATORS-1];
     int          failures = 0;
 
-    bf16_multi_mac_tree #(
+    bf16_dual_mac_tree #(
         .MULTIPLIERS          (MULTIPLIERS),
         .ACCUMULATORS         (ACCUMULATORS),
+        .LANES                (LANES),
         .REDUCTION_GUARD_BITS (4),
-        .PIPELINE_STAGES      (PIPELINE_STAGES)
+        .PIPELINE_STAGES      (PIPELINE_STAGES),
+        .LANE_CYCLES          (LANE_CYCLES),
+        .ACCUMULATE_STAGES    (ACCUMULATE_STAGES)
     ) dut (.*);
+
+    // Column visit order: alternate lanes on every issue cycle.
+    function automatic int interleaved_column(input int step);
+        return (step / LANES) + (step % LANES) * LANE_DEPTH;
+    endfunction
 
     // Clock period in ns, overridable with +period=<ns> so a switching-activity
     // dump can be taken at the same frequency the netlist is constrained to.
@@ -60,8 +84,9 @@ module bf16_multi_mac_tree_gemv_tb;
     initial begin
         if ($test$plusargs("dump_vcd")) begin
             $dumpfile($sformatf(
-                "build/vcd/bf16_multi_mac_tree_gemv_p%0d_%0dps.vcd",
-                PIPELINE_STAGES, int'(clock_half_period * 2000.0)));
+                "build/vcd/bf16_dual_mac_tree_gemv_p%0da%0d_%0dps.vcd",
+                PIPELINE_STAGES, ACCUMULATE_STAGES,
+                int'(clock_half_period * 2000.0)));
             $dumpvars(0, dut);
         end
     end
@@ -144,9 +169,11 @@ module bf16_multi_mac_tree_gemv_tb;
         @(negedge clk);
         reset = 1'b0;
 
-        // A-stationary: load eight A elements, then sweep all 32 columns.
+        // A-stationary: load eight A elements, then sweep all 32 columns in
+        // lane-alternating order.
         for (int g = 0; g < GROUPS; g++) begin
-            for (int j = 0; j < ACCUMULATORS; j++) begin
+            for (int step = 0; step < ACCUMULATORS; step++) begin
+                automatic int j = interleaved_column(step);
                 @(negedge clk);
                 for (int i = 0; i < MULTIPLIERS; i++) begin
                     a[i] = a_vector[g*MULTIPLIERS + i];
@@ -161,8 +188,8 @@ module bf16_multi_mac_tree_gemv_tb;
         @(negedge clk);
         enable = 1'b0;
 
-        // Drain the product pipeline before reading the accumulators.
-        repeat (PIPELINE_STAGES + 1) @(posedge clk);
+        // Drain the lane pipelines before reading the accumulators.
+        repeat (LATENCY + 1) @(posedge clk);
         @(negedge clk);
 
         for (int j = 0; j < ACCUMULATORS; j++) begin
@@ -172,16 +199,16 @@ module bf16_multi_mac_tree_gemv_tb;
         end
 
         if (failures == 0) begin
-            $display("\nBF16 MULTI-MAC TREE GEMV TEST PASSED (%0dx%0d dot products)",
+            $display("\nBF16 DUAL-MAC TREE GEMV TEST PASSED (%0dx%0d dot products)",
                      DEPTH, ACCUMULATORS);
             $finish;
         end
-        $fatal(1, "BF16 MULTI-MAC TREE GEMV TEST FAILED with %0d failure(s)",
+        $fatal(1, "BF16 DUAL-MAC TREE GEMV TEST FAILED with %0d failure(s)",
                failures);
     end
 
     initial begin
         #500000;
-        $fatal(1, "BF16 MULTI-MAC TREE GEMV TEST FAILED: timeout");
+        $fatal(1, "BF16 DUAL-MAC TREE GEMV TEST FAILED: timeout");
     end
 endmodule
