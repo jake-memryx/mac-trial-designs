@@ -7,7 +7,8 @@ GENUS ?= genus
 	test-bf16-multi-mac-tree test-bf16-mama-gemv \
 	test-bf16-multi-mac-tree-gemv cln4p-libs synth synth-bf16-mac \
 	synth-bf16-mama synth-bf16-multi-mac-tree power-bf16-multi-mac-tree \
-	vcd-bf16-mama-gemv vcd-bf16-multi-mac-tree-gemv licenses clean
+	breakdown-bf16-multi-mac-tree vcd-bf16-mama-gemv \
+	vcd-bf16-multi-mac-tree-gemv licenses clean
 
 all: test
 
@@ -154,6 +155,19 @@ power-bf16-multi-mac-tree: cln4p-libs
 		TREE_VCD=../../$(TREE_VCD) \
 		$(GENUS) -batch \
 		-files ../../scripts/report_power_tree.tcl -log genus_power.log
+
+# Per-stage area and power breakdown. Separate run because it holds every module
+# boundary so each stage stays attributable, which costs some QoR.
+breakdown-bf16-multi-mac-tree: cln4p-libs
+	$(MAKE) $(TREE_VCD)
+	@mkdir -p build/breakdown_tree
+	cd build/breakdown_tree && \
+		TREE_PERIOD=$(TREE_PERIOD) \
+		TREE_PIPELINE_STAGES=$(TREE_PIPELINE_STAGES) \
+		TREE_ACCUMULATE_STAGES=$(TREE_ACC) \
+		TREE_VCD=../../$(TREE_VCD) \
+		$(GENUS) -batch \
+		-files ../../scripts/report_breakdown_tree.tcl -log genus.log
 
 licenses:
 	@./scripts/check_licenses.sh
