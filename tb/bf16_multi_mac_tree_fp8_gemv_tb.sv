@@ -2,35 +2,35 @@
 
 // Override at compile time with -define PIPELINE_STAGES=<0|1|2>.
 `ifndef PIPELINE_STAGES
-`define PIPELINE_STAGES 0
+`define PIPELINE_STAGES 2
 `endif
 
 // Override at compile time with -define ACCUMULATE_STAGES=<0|1|2>.
 `ifndef ACCUMULATE_STAGES
-`define ACCUMULATE_STAGES 0
+`define ACCUMULATE_STAGES 2
 `endif
 
-// Override with -define FP8_ENABLE=1 to exercise BF16 mode on the dual-format
-// build, which is also how the BF16-mode power dump is taken.
-`ifndef FP8_ENABLE
-`define FP8_ENABLE 0
-`endif
-
-// C[32] = A[1024] x B[1024][32] on a tree MAC with 8 multipliers and 32
-// accumulators. Eight A elements are held stationary while 32 cycles walk the
-// output columns: cycle j reduces the eight products A[k+i]*B[k+i][j] and folds
-// the result into accumulator j. Each group of eight A elements therefore takes
-// 32 cycles, and 128 groups cover the full 1024-deep dot products.
-module bf16_multi_mac_tree_gemv_tb;
+// C[32] = A[1024] x B[1024][32] in E4M3 mode on the dual-format tree MAC.
+//
+// FP8 mode retires 16 MACs per cycle on the same 256-bit operand bus, so a
+// group covers 16 depth elements instead of 8 and the sweep needs half as many
+// groups as the BF16 testbench. Packing follows the RTL convention: element i
+// of a group is the low byte of operand word i, element i+8 is the high byte.
+//
+// Accumulators are visited round-robin, which satisfies the in-flight reuse
+// contract that the pipelined accumulate loop depends on.
+module bf16_multi_mac_tree_fp8_gemv_tb;
     localparam int unsigned MULTIPLIERS  = 8;
+    localparam int unsigned LANES        = 2 * MULTIPLIERS;
     localparam int unsigned ACCUMULATORS = 32;
     localparam int unsigned SELECT_WIDTH = $clog2(ACCUMULATORS);
     localparam int unsigned DEPTH        = 1024;
-    localparam int unsigned GROUPS       = DEPTH / MULTIPLIERS;
+    localparam int unsigned GROUPS       = DEPTH / LANES;
     localparam int unsigned PIPELINE_STAGES = `PIPELINE_STAGES;
     localparam int unsigned ACCUMULATE_STAGES = `ACCUMULATE_STAGES;
     localparam int unsigned LATENCY = PIPELINE_STAGES + ACCUMULATE_STAGES;
-    localparam real         SIGMA        = 10.0;
+    // E4M3 tops out at 448, so keep the stimulus well inside the range.
+    localparam real         SIGMA        = 2.0;
     localparam real         TOLERANCE    = 1.0e-3;
 
     logic                    clk;
@@ -43,8 +43,8 @@ module bf16_multi_mac_tree_gemv_tb;
     logic [15:0]             b [0:MULTIPLIERS-1];
     logic [31:0]             accumulator;
 
-    logic [15:0] a_vector [0:DEPTH-1];
-    logic [15:0] b_matrix [0:DEPTH-1][0:ACCUMULATORS-1];
+    logic [7:0]  a_vector [0:DEPTH-1];
+    logic [7:0]  b_matrix [0:DEPTH-1][0:ACCUMULATORS-1];
     real         reference [0:ACCUMULATORS-1];
     real         magnitude [0:ACCUMULATORS-1];
     int          failures = 0;
@@ -53,13 +53,11 @@ module bf16_multi_mac_tree_gemv_tb;
         .MULTIPLIERS          (MULTIPLIERS),
         .ACCUMULATORS         (ACCUMULATORS),
         .REDUCTION_GUARD_BITS (4),
-        .FP8_ENABLE           (`FP8_ENABLE),
+        .FP8_ENABLE           (1),
         .PIPELINE_STAGES      (PIPELINE_STAGES),
         .ACCUMULATE_STAGES    (ACCUMULATE_STAGES)
     ) dut (.*);
 
-    // Clock period in ns, overridable with +period=<ns> so a switching-activity
-    // dump can be taken at the same frequency the netlist is constrained to.
     function automatic real plusarg_half_period();
         real period;
         if ($value$plusargs("period=%f", period))
@@ -72,35 +70,63 @@ module bf16_multi_mac_tree_gemv_tb;
     initial clk = 1'b0;
     always #(clock_half_period) clk = ~clk;
 
-    // Optional switching-activity dump for power analysis (+dump_vcd).
     initial begin
         if ($test$plusargs("dump_vcd")) begin
             $dumpfile($sformatf(
-                "build/vcd/bf16_multi_mac_tree_gemv%s_p%0da%0d_%0dps.vcd",
-                (`FP8_ENABLE) ? "_dual" : "",
+                "build/vcd/bf16_multi_mac_tree_fp8_gemv_p%0da%0d_%0dps.vcd",
                 PIPELINE_STAGES, ACCUMULATE_STAGES,
                 int'(clock_half_period * 2000.0)));
             $dumpvars(0, dut);
         end
     end
 
-    // Round an FP32 value to BF16 with round-to-nearest, ties-to-even.
-    function automatic logic [15:0] real_to_bf16(input real value);
-        logic [31:0] bits;
-        logic [15:0] truncated;
-        bits      = $shortrealtobits(shortreal'(value));
-        truncated = bits[31:16];
-        if (bits[15] && (|bits[14:0] || bits[16]))
-            truncated = truncated + 16'b1;
-        return truncated;
+    // OCP E4M3: bias 7, no infinity, NaN only at S.1111.111, max normal 448.
+    function automatic bit e4m3_is_nan(input logic [7:0] value);
+        return (value[6:3] == 4'hf) && (value[2:0] == 3'h7);
     endfunction
 
-    function automatic real bf16_to_real(input logic [15:0] value);
-        return $bitstoshortreal({value, 16'b0});
+    function automatic real e4m3_to_real(input logic [7:0] value);
+        logic [3:0] exponent_field;
+        logic [2:0] mantissa;
+        real        result;
+        begin
+            exponent_field = value[6:3];
+            mantissa       = value[2:0];
+            if (exponent_field == 4'h0)
+                result = (real'(mantissa) / 8.0) * (2.0 ** -6.0);
+            else
+                result = (1.0 + real'(mantissa) / 8.0) *
+                         (2.0 ** (real'(exponent_field) - 7.0));
+            return value[7] ? -result : result;
+        end
     endfunction
 
-    // Box-Muller transform: zero-mean normal samples with standard deviation
-    // SIGMA, built from two uniform (0,1) draws.
+    // Nearest E4M3 encoding by search. The reference model is built from the
+    // quantized codes, so any consistent rounding rule is valid here.
+    function automatic logic [7:0] real_to_e4m3(input real value);
+        real        best_error;
+        real        candidate;
+        real        error;
+        logic [7:0] best;
+        begin
+            best       = 8'h00;
+            best_error = 1.0e30;
+            for (int i = 0; i < 256; i++) begin
+                if (e4m3_is_nan(i[7:0]))
+                    continue;
+                candidate = e4m3_to_real(i[7:0]);
+                error     = candidate - value;
+                if (error < 0.0)
+                    error = -error;
+                if (error < best_error) begin
+                    best_error = error;
+                    best       = i[7:0];
+                end
+            end
+            return best;
+        end
+    endfunction
+
     function automatic real normal_sample();
         real uniform_a;
         real uniform_b;
@@ -119,11 +145,11 @@ module bf16_multi_mac_tree_gemv_tb;
             magnitude[j] = 0.0;
         end
         for (int k = 0; k < DEPTH; k++) begin
-            a_vector[k] = real_to_bf16(normal_sample());
-            a_real      = bf16_to_real(a_vector[k]);
+            a_vector[k] = real_to_e4m3(normal_sample());
+            a_real      = e4m3_to_real(a_vector[k]);
             for (int j = 0; j < ACCUMULATORS; j++) begin
-                b_matrix[k][j] = real_to_bf16(normal_sample());
-                b_real         = bf16_to_real(b_matrix[k][j]);
+                b_matrix[k][j] = real_to_e4m3(normal_sample());
+                b_real         = e4m3_to_real(b_matrix[k][j]);
                 term           = a_real * b_real;
                 reference[j]   = reference[j] + term;
                 magnitude[j]   = magnitude[j] + (term >= 0.0 ? term : -term);
@@ -151,7 +177,7 @@ module bf16_multi_mac_tree_gemv_tb;
         reset              = 1'b1;
         clear              = 1'b0;
         enable             = 1'b0;
-        mode               = 1'b0;
+        mode               = 1'b1;   // E4M3
         accumulator_select = '0;
         for (int i = 0; i < MULTIPLIERS; i++) begin
             a[i] = '0;
@@ -163,13 +189,15 @@ module bf16_multi_mac_tree_gemv_tb;
         @(negedge clk);
         reset = 1'b0;
 
-        // A-stationary: load eight A elements, then sweep all 32 columns.
+        // A-stationary: load 16 A elements, then sweep all 32 columns.
         for (int g = 0; g < GROUPS; g++) begin
             for (int j = 0; j < ACCUMULATORS; j++) begin
                 @(negedge clk);
                 for (int i = 0; i < MULTIPLIERS; i++) begin
-                    a[i] = a_vector[g*MULTIPLIERS + i];
-                    b[i] = b_matrix[g*MULTIPLIERS + i][j];
+                    a[i] = {a_vector[g*LANES + i + MULTIPLIERS],
+                            a_vector[g*LANES + i]};
+                    b[i] = {b_matrix[g*LANES + i + MULTIPLIERS][j],
+                            b_matrix[g*LANES + i][j]};
                 end
                 accumulator_select = j[SELECT_WIDTH-1:0];
                 enable             = 1'b1;
@@ -180,7 +208,6 @@ module bf16_multi_mac_tree_gemv_tb;
         @(negedge clk);
         enable = 1'b0;
 
-        // Drain the product and accumulate pipelines before reading out.
         repeat (LATENCY + 1) @(posedge clk);
         @(negedge clk);
 
@@ -191,16 +218,16 @@ module bf16_multi_mac_tree_gemv_tb;
         end
 
         if (failures == 0) begin
-            $display("\nBF16 MULTI-MAC TREE GEMV TEST PASSED (%0dx%0d dot products)",
-                     DEPTH, ACCUMULATORS);
+            $display("\nBF16 MULTI-MAC TREE FP8 GEMV TEST PASSED (%0dx%0d dot products, %0d MACs/cycle)",
+                     DEPTH, ACCUMULATORS, LANES);
             $finish;
         end
-        $fatal(1, "BF16 MULTI-MAC TREE GEMV TEST FAILED with %0d failure(s)",
+        $fatal(1, "BF16 MULTI-MAC TREE FP8 GEMV TEST FAILED with %0d failure(s)",
                failures);
     end
 
     initial begin
         #500000;
-        $fatal(1, "BF16 MULTI-MAC TREE GEMV TEST FAILED: timeout");
+        $fatal(1, "BF16 MULTI-MAC TREE FP8 GEMV TEST FAILED: timeout");
     end
 endmodule

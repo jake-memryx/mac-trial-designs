@@ -19,12 +19,17 @@ set stages [expr {[info exists env(TREE_PIPELINE_STAGES)] ?
                   $env(TREE_PIPELINE_STAGES) : 2}]
 set acc_stages [expr {[info exists env(TREE_ACCUMULATE_STAGES)] ?
                       $env(TREE_ACCUMULATE_STAGES) : 2}]
+set fp8 [expr {[info exists env(TREE_FP8)] ? $env(TREE_FP8) : 0}]
+set vcd_scope [expr {[info exists env(TREE_VCD_SCOPE)] ?
+                     $env(TREE_VCD_SCOPE) : "bf16_multi_mac_tree_gemv_tb/dut"}]
 
-read_hdl -sv ../../rtl/bf16_mac.sv ../../rtl/bf16_mac_tree_core.sv \
+read_hdl -sv ../../rtl/bf16_mac.sv ../../rtl/fp8_mac.sv \
+             ../../rtl/bf16_mac_tree_core.sv \
              ../../rtl/bf16_multi_mac_tree.sv
 elaborate bf16_multi_mac_tree \
     -parameters [list {MULTIPLIERS 8} {ACCUMULATORS 32} \
                       {REDUCTION_GUARD_BITS 4} \
+                      [list FP8_ENABLE $fp8] \
                       [list PIPELINE_STAGES $stages] \
                       [list ACCUMULATE_STAGES $acc_stages]]
 check_design -unresolved
@@ -39,7 +44,7 @@ syn_map
 syn_opt
 
 if {[info exists env(TREE_VCD)]} {
-    read_vcd -static $env(TREE_VCD) -vcd_scope bf16_multi_mac_tree_gemv_tb/dut
+    read_vcd -static $env(TREE_VCD) -vcd_scope $vcd_scope
 }
 
 # These reports print to stdout rather than returning a string, so they must be

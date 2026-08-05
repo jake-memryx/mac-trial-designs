@@ -142,6 +142,143 @@ Two caveats on the numbers:
 is functionally verified but was never needed to close timing, so it is not
 built by the flow.
 
+The table above predates enabling `lp_insert_clock_gating` in the synthesis
+script (added for the dual-format build below, which depends on it). With clock
+gating on, the same BF16-only pipelined build measures **9271 cells, 694.0 um2,
+5.450 mW, 0.454 pJ/OP** at 0 ps slack. That is the baseline the dual-format
+comparison uses.
+
+### Dual-format BF16 / E4M3 mode
+
+`FP8_ENABLE=1` adds a runtime-selectable E4M3 (OCP FP8) mode at double
+throughput: 16 MACs/cycle against 8. Two FP8 values pack into each 16-bit
+operand word, so the 256-bit operand bus, the 32-entry accumulator bank and the
+FP32 accumulate path are all unchanged. Build with
+`make synth-bf16-multi-mac-tree TREE_FP8=1`.
+
+The reuse is nearly total because of one identity. A BF16 significand
+`{1'b1, frac[6:0]}` is an integer equal to `value * 2^7`; left-justifying the
+3-bit E4M3 mantissa as `{1'b1, mant[2:0], 4'b0}` gives exactly the same scaling.
+So the 8x8 significand multiply, the normalize-on-bit-15 test and the FP32
+product encoding are bit-identical in both formats, and only the exponent bias
+differs:
+
+| Format | `result_exp` |
+|---|---|
+| BF16 | `exp_a + exp_b - 127` |
+| E4M3 | `exp_a + exp_b + 113` |
+
+E4M3 products land in `[115,143]` in the FP32 exponent field, so they can
+neither overflow nor underflow it and need no saturation logic. Everything
+downstream of the products — alignment, reduction, normalize, round, accumulate
+— is format-agnostic and untouched; the extra reduction level the wider lane
+count needs is just `MULTIPLIERS=16` on the existing parameterized cores.
+E4M3 subnormals are normalized properly rather than flushed.
+
+**BF16 is kept first-class by not sharing the reduction tree.** An earlier
+version widened one shared tree to 16 lanes, which taxed BF16 by 31%. Measuring
+that penalty showed 79% of it was *combinational* logic in BF16's own active
+path, not idle-lane leakage or clock power, so it could not be gated away: the
+shared tree gave BF16 an extra reduction level, one more bit of datapath width
+and dual-format decode muxes inside every lane.
+
+The shipping design therefore gives each format its own reduction path and
+shares only what the per-stage breakdown showed actually dominates — the
+accumulator bank, pipeline registers, muxing and the FP32 accumulate adder:
+
+- **BF16 path**: 8 pristine `bf16_multiplier` -> align/normalize with
+  `SIGNIFICAND_BITS=16` (20-bit window, SUM_WIDTH 24). Identical to a BF16-only
+  build.
+- **E4M3 path**: 16 `mac_multiplier` -> align/normalize with
+  `SIGNIFICAND_BITS=8` and its own `FP8_GUARD_BITS` (12-bit window,
+  SUM_WIDTH 17). Independent sizing is only possible because the paths are
+  separate, and it is worth a large fraction of the FP8 gain.
+- The two join at a 32-bit mux feeding the existing accumulate operand
+  register, which keeps it out of the tree's critical path.
+- Each path's operands are mode-gated so the idle path is combinationally
+  static, and the mode travels with each operation through the pipeline so a
+  mode change on consecutive cycles cannot disturb work in flight.
+
+All 1.5 GHz, `PIPELINE_STAGES=2`, `ACCUMULATE_STAGES=2`, clock gating enabled,
+every build at 0 ps slack:
+
+| Build | Mode | MACs/cyc | Cells | Area (um2) | Power (mW) | pJ/OP |
+|---|---|---|---|---|---|---|
+| BF16-only | BF16 | 8 | 9271 | 694.0 | 5.450 | 0.454 |
+| dual | E4M3 | 16 | 14408 | 985.6 | 5.724 | **0.239** |
+| dual | BF16 | 8 | 14408 | 985.6 | 6.282 | 0.523 |
+
+FP8 mode reaches **0.239 pJ/OP, 1.90x better than the BF16 baseline at twice the
+throughput** — close to ideal scaling, because the ~65% of the design that is
+bank, registers, muxing and accumulate adder is amortized over 2x the work
+rather than duplicated.
+
+### Is BF16 actually untaxed? Block-level attribution
+
+The flattened production builds show BF16 mode at 6.282 mW against the
+dedicated build's 5.450 mW, a 15.3% penalty. A hierarchy-preserved run of both
+(`make breakdown-bf16-multi-mac-tree`, which holds every module boundary so each
+block is attributable) tells a different story. BF16-mode power, in mW:
+
+| Block | BF16-only | Dual, BF16 mode | Delta |
+|---|---|---|---|
+| `bf16_align_stage` | 1.390 | 1.187 | **-0.203** |
+| 8x `bf16_multiplier` | 0.826 | 0.699 | **-0.128** |
+| `bf16_normalize_stage` | 0.423 | 0.355 | **-0.068** |
+| accumulate adder, both halves | 0.540 | 0.560 | +0.021 |
+| **entire FP8 path** | - | **0.001** | +0.001 |
+| top residual (bank, registers, muxes, control) | 3.497 | 3.825 | +0.328 |
+| **total** | **6.676** | **6.627** | **-0.050 (-0.7%)** |
+
+Three conclusions:
+
+- **The FP8 path is genuinely dark during BF16 operation** - 0.001 mW for 16
+  multipliers plus a 16-lane align stage and reduction tree, i.e. leakage only.
+  Operand gating plus clock gating do what they were meant to.
+- **The BF16 datapath is the same hardware**: `bf16_align_stage` 84.234 ->
+  83.977 um2, multipliers 130.832 -> 130.576 um2, normalize 40.837 -> 41.469
+  um2. Nothing was added to it.
+- **BF16-mode power is 0.7% *lower* than the dedicated build.** The BF16 blocks
+  all come out cheaper, which is not noise: the operand isolation mux adds a
+  gate layer ahead of the align stage, and that re-times arriving edges enough
+  to cut glitch propagation into its barrel shifters - the highest glitch-power
+  block in the design. It saves 0.203 mW there, more than paying for itself.
+
+So the 15.3% seen in the flattened flow is **not an architectural tax**; it is
+Genus making different global optimization choices on a larger netlist. The
+residual real cost is the +0.328 mW top-level growth (the FP8 path's pipeline
+registers, the isolation muxes, the result mux and `ctrl_mode_q`), which the
+align-stage glitch saving happens to offset.
+
+The practical implication is that preserving the two path hierarchies in the
+production build (rather than letting `syn_opt` dissolve them) should capture
+this, since the hierarchy-preserved netlist is the one that shows no penalty.
+That is untested.
+
+Two negative results worth recording:
+
+- **Removing the BF16-side operand gate makes things worse, not better.** The
+  reasoning was that leaving the BF16 cone completely ungated would give it a
+  pristine path while FP8 mode absorbed the idle toggling. Measured: BF16 mode
+  went to 6.537 mW (0.545 pJ/OP, worse) and FP8 mode to 7.251 mW (0.302 pJ/OP,
+  27% worse). The ~0.9 mW attributed to the gate was mostly run-to-run
+  optimization variance. Both paths stay gated.
+- Clock gating is load-bearing for this design, not an incidental setting: the
+  mode-qualified pipeline enables only become dark logic once
+  `lp_insert_clock_gating` is on. Without it, no gates are inserted at all.
+
+Area is +42% over the BF16-only build, which the area-secondary priority
+accepts.
+
+Verification: the dual-format multiplier is checked **exhaustively** over all
+65536 E4M3 input pairs against a real-valued reference, covering every
+subnormal, NaN, zero and the 448 max normal, and is separately proven
+bit-identical to the original `bf16_multiplier` in BF16 mode. A mode-switching
+testbench covers back-to-back alternating modes and cross-mode accumulation into
+one accumulator. The FP8 GEMV testbench passes at the same `1e-3` relative
+tolerance as the BF16 one even with the narrow 12-bit window. Ten testbenches
+run under `make test`.
+
 ### Rejected alternative
 
 An earlier experiment (`bf16_dual_mac_tree`, removed) moved the accumulator mux

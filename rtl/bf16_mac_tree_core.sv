@@ -1,36 +1,42 @@
 `timescale 1ns/1ps
 
-// Combinational halves of the BF16 block-floating-point reduction tree.
+// Combinational halves of the block-floating-point reduction tree.
 //
 // The tree is split at the natural pipeline boundary so a wrapper can either
 // register the boundary or bypass it:
 //
-//   bf16_mac_tree_align     : a[], b[]        -> shared exponent, signed leaves
+//   bf16_mac_tree_align     : products -> shared exponent, signed leaves
 //   bf16_mac_tree_normalize : leaves, exponent -> one rounded FP32 result
 //
 // Both modules are purely combinational; all sequencing, accumulator banking
 // and pipeline control lives in the wrapper.
+//
+// Neither module knows the input operand format. They consume products already
+// encoded as FP32, so the same reduction hardware serves BF16 and FP8 lanes.
+// The wrapper owns the multiplier array.
 
-// Multiply stage, maximum-exponent tree, shared-exponent alignment and
-// special-value detection.
+// Maximum-exponent tree, shared-exponent alignment and special-value detection.
 module bf16_mac_tree_align #(
     parameter int unsigned MULTIPLIERS = 4,
     parameter int unsigned REDUCTION_GUARD_BITS = 4,
+    // Significant bits in a product. A BF16 product has 16; an E4M3 product has
+    // only 8, left-justified in the same field, so a dedicated FP8 path can use
+    // a proportionally narrower alignment window and reduction tree.
+    parameter int unsigned SIGNIFICAND_BITS = 16,
     parameter int unsigned TREE_LEVELS =
         (MULTIPLIERS <= 1) ? 0 : $clog2(MULTIPLIERS),
     parameter int unsigned TREE_LEAVES = 1 << TREE_LEVELS,
-    parameter int unsigned MAGNITUDE_WIDTH = 16 + REDUCTION_GUARD_BITS,
+    parameter int unsigned MAGNITUDE_WIDTH =
+        SIGNIFICAND_BITS + REDUCTION_GUARD_BITS,
     parameter int unsigned SUM_WIDTH = MAGNITUDE_WIDTH + TREE_LEVELS + 1
 ) (
-    input  logic [15:0] a [0:MULTIPLIERS-1],
-    input  logic [15:0] b [0:MULTIPLIERS-1],
+    input  logic [31:0] product [0:TREE_LEAVES-1],
     output logic [7:0]  maximum_exponent,
     output logic signed [SUM_WIDTH-1:0] leaf_value [0:TREE_LEAVES-1],
     output logic        positive_infinity,
     output logic        negative_infinity,
     output logic        invalid_result
 );
-    logic [31:0] product [0:TREE_LEAVES-1];
     logic [7:0]  exponent_tree [0:TREE_LEVELS][0:TREE_LEAVES-1];
     logic [MAGNITUDE_WIDTH-1:0] aligned_magnitude [0:TREE_LEAVES-1];
 
@@ -41,16 +47,6 @@ module bf16_mac_tree_align #(
     genvar leaf;
     generate
         for (leaf = 0; leaf < TREE_LEAVES; leaf = leaf + 1) begin : g_leaf
-            if (leaf < MULTIPLIERS) begin : g_product
-                bf16_multiplier multiplier (
-                    .a       (a[leaf]),
-                    .b       (b[leaf]),
-                    .product (product[leaf])
-                );
-            end else begin : g_padding
-                assign product[leaf] = 32'b0;
-            end
-
             // Special values are handled separately, so they contribute zero
             // to the finite exponent and significand trees.
             assign exponent_tree[0][leaf] =
@@ -99,8 +95,11 @@ module bf16_mac_tree_align #(
                 align_shift = maximum_exponent -
                               product[align_term_index][30:23];
                 if (align_shift < MAGNITUDE_WIDTH) begin
+                    // The significand occupies the top SIGNIFICAND_BITS of the
+                    // mantissa field; anything below is always zero.
                     aligned_magnitude[align_term_index] =
-                        {{1'b1, product[align_term_index][22:8]},
+                        {{1'b1, product[align_term_index]
+                                       [22 -: (SIGNIFICAND_BITS-1)]},
                          {REDUCTION_GUARD_BITS{1'b0}}} >> align_shift;
                 end
 
@@ -143,10 +142,12 @@ endmodule
 module bf16_mac_tree_normalize #(
     parameter int unsigned MULTIPLIERS = 4,
     parameter int unsigned REDUCTION_GUARD_BITS = 4,
+    parameter int unsigned SIGNIFICAND_BITS = 16,
     parameter int unsigned TREE_LEVELS =
         (MULTIPLIERS <= 1) ? 0 : $clog2(MULTIPLIERS),
     parameter int unsigned TREE_LEAVES = 1 << TREE_LEVELS,
-    parameter int unsigned MAGNITUDE_WIDTH = 16 + REDUCTION_GUARD_BITS,
+    parameter int unsigned MAGNITUDE_WIDTH =
+        SIGNIFICAND_BITS + REDUCTION_GUARD_BITS,
     parameter int unsigned SUM_WIDTH = MAGNITUDE_WIDTH + TREE_LEVELS + 1
 ) (
     input  logic [7:0]  maximum_exponent,
@@ -224,8 +225,9 @@ module bf16_mac_tree_normalize #(
                     leading_one = bit_index;
             end
 
+            // The leading one of a full-scale leaf sits at MAGNITUDE_WIDTH-1.
             result_exponent = maximum_exponent + leading_one -
-                              (15 + REDUCTION_GUARD_BITS);
+                              (MAGNITUDE_WIDTH - 1);
 
             if (leading_one > 26) begin
                 normalize_shift = leading_one - 26;
