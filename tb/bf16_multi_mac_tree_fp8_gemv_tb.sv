@@ -41,6 +41,9 @@ module bf16_multi_mac_tree_fp8_gemv_tb;
     logic [SELECT_WIDTH-1:0] accumulator_select;
     logic [15:0]             a [0:MULTIPLIERS-1];
     logic [15:0]             b [0:MULTIPLIERS-1];
+    logic                    external_select;
+    logic [31:0]             external_operand;
+    logic [31:0]             chain_out;
     logic [31:0]             accumulator;
 
     logic [7:0]  a_vector [0:DEPTH-1];
@@ -178,6 +181,8 @@ module bf16_multi_mac_tree_fp8_gemv_tb;
         clear              = 1'b0;
         enable             = 1'b0;
         mode               = 1'b1;   // E4M3
+        external_select    = 1'b0;
+        external_operand   = 32'b0;
         accumulator_select = '0;
         for (int i = 0; i < MULTIPLIERS; i++) begin
             a[i] = '0;

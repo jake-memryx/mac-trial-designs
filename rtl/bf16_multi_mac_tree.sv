@@ -30,6 +30,11 @@ module bf16_multi_mac_tree #(
     // the lane count doubles. With FP8_ENABLE = 0 the mode input is tied off
     // and the design is identical to the BF16-only build.
     parameter bit FP8_ENABLE = 0,
+    // Allows an operation to accumulate an externally supplied FP32 value
+    // instead of the reduction-tree result, so several of these units can be
+    // daisy-chained and fold a neighbour's accumulator into their own. With
+    // EXTERNAL_ACCUMULATE = 0 the ports tie off and the logic folds away.
+    parameter bit EXTERNAL_ACCUMULATE = 0,
     parameter int unsigned PIPELINE_STAGES = 0,
     // Pipeline depth of the accumulate read-modify-write loop. Legal because
     // accumulators are selected round-robin, so an accumulator is not revisited
@@ -70,6 +75,12 @@ module bf16_multi_mac_tree #(
     input  logic [SELECT_WIDTH-1:0] accumulator_select,
     input  logic [15:0]             a [0:MULTIPLIERS-1],
     input  logic [15:0]             b [0:MULTIPLIERS-1],
+    // This operation accumulates external_operand instead of the tree result.
+    // Sampled with the operands; ignored unless EXTERNAL_ACCUMULATE.
+    input  logic                    external_select,
+    input  logic [31:0]             external_operand,
+    // Registered copy of accumulator 0, the value a neighbouring unit folds in.
+    output logic [31:0]             chain_out,
     output logic [31:0]             accumulator
 );
     logic        effective_mode;
@@ -115,8 +126,20 @@ module bf16_multi_mac_tree #(
     logic                    ctrl_valid_q [0:CHAIN_DEPTH-1];
     logic [SELECT_WIDTH-1:0] ctrl_sel_q   [0:CHAIN_DEPTH-1];
     // The mode travels with the operation, so a mode change on consecutive
-    // cycles cannot disturb an operation already in flight.
+    // cycles cannot disturb an operation already in flight. The external-source
+    // select rides along for the same reason.
     logic                    ctrl_mode_q  [0:CHAIN_DEPTH-1];
+    logic                    ctrl_ext_q   [0:CHAIN_DEPTH-1];
+
+    // External operand delayed to reach the accumulate operand register in step
+    // with its control. Clamped so the array stays in range when unpipelined.
+    localparam int unsigned EXT_DEPTH =
+        (PIPELINE_STAGES == 0) ? 1 : PIPELINE_STAGES;
+
+    logic        tree_idle;
+    logic        result_external;
+    logic [31:0] ext_delay [0:EXT_DEPTH-1];
+    logic [31:0] ext_at_result;
 
     // Mode of the operation resident in each stage: stage 1 acts on the live
     // operands, stage 2 one cycle later, and the result mux at the accumulate
@@ -143,20 +166,27 @@ module bf16_multi_mac_tree #(
     // because FP8 operation then pays for the BF16 cone toggling and the
     // BF16 saving does not materialise.
     assign effective_mode = FP8_ENABLE ? mode : 1'b0;
+    // An external accumulate does no multiply-reduce work, so both trees are
+    // held static for the same reason the idle format's path is.
+    assign tree_idle = EXTERNAL_ACCUMULATE ? external_select : 1'b0;
 
     always_comb begin
         for (int unsigned m = 0; m < MULTIPLIERS; m++) begin
-            bf16_a[m] = effective_mode ? 16'b0 : a[m];
-            bf16_b[m] = effective_mode ? 16'b0 : b[m];
+            bf16_a[m] = (effective_mode || tree_idle) ? 16'b0 : a[m];
+            bf16_b[m] = (effective_mode || tree_idle) ? 16'b0 : b[m];
         end
         // FP8 packing: element m of the vector is the low byte of operand word
         // m, element m+MULTIPLIERS is the high byte. The reduction is a sum, so
         // the lane assignment only has to match the driver's convention.
         for (int unsigned m = 0; m < MULTIPLIERS; m++) begin
-            fp8_a[m]               = effective_mode ? a[m][7:0]  : 8'b0;
-            fp8_b[m]               = effective_mode ? b[m][7:0]  : 8'b0;
-            fp8_a[m + MULTIPLIERS] = effective_mode ? a[m][15:8] : 8'b0;
-            fp8_b[m + MULTIPLIERS] = effective_mode ? b[m][15:8] : 8'b0;
+            fp8_a[m]               = (effective_mode && !tree_idle)
+                                     ? a[m][7:0]  : 8'b0;
+            fp8_b[m]               = (effective_mode && !tree_idle)
+                                     ? b[m][7:0]  : 8'b0;
+            fp8_a[m + MULTIPLIERS] = (effective_mode && !tree_idle)
+                                     ? a[m][15:8] : 8'b0;
+            fp8_b[m + MULTIPLIERS] = (effective_mode && !tree_idle)
+                                     ? b[m][15:8] : 8'b0;
         end
     end
 
@@ -350,7 +380,49 @@ module bf16_multi_mac_tree #(
 
     // The two paths join here. Muxing into the existing operand register keeps
     // the mux out of the tree's critical path.
-    assign reduced_result = result_mode ? fp8_stage2 : bf16_stage2;
+    // The two tree paths join here, with the external operand as a third
+    // source. Muxing into the existing operand register keeps this out of the
+    // tree's critical path.
+    assign reduced_result = result_external ? ext_at_result
+                          : (result_mode ? fp8_stage2 : bf16_stage2);
+
+    // External operand delay, aligning the data with its control tap. The
+    // registers are enabled only for external operations, so they clock-gate
+    // away entirely when the feature is idle.
+    generate
+        if (EXTERNAL_ACCUMULATE && PIPELINE_STAGES > 0) begin : g_ext_delay
+            always_ff @(posedge clk) begin
+                if (reset) begin
+                    for (int unsigned d = 0; d < PIPELINE_STAGES; d++)
+                        ext_delay[d] <= 32'b0;
+                end else begin
+                    if (tree_idle)
+                        ext_delay[0] <= external_operand;
+                    for (int unsigned d = 1; d < PIPELINE_STAGES; d++)
+                        if (ctrl_ext_q[d-1])
+                            ext_delay[d] <= ext_delay[d-1];
+                end
+            end
+        end else begin : g_ext_delay_unused
+            always_comb ext_delay[0] = external_operand;
+        end
+    endgenerate
+
+    // Chain output: a registered copy of accumulator 0, which is the only
+    // accumulator that moves between units. Registering it keeps the
+    // inter-unit path off a combinational bank read.
+    generate
+        if (EXTERNAL_ACCUMULATE) begin : g_chain_out
+            always_ff @(posedge clk) begin
+                if (reset)
+                    chain_out <= 32'b0;
+                else
+                    chain_out <= accumulator_bank[0];
+            end
+        end else begin : g_no_chain_out
+            always_comb chain_out = 32'b0;
+        end
+    endgenerate
 
     // enable and the destination selector travel with the product data so each
     // stage acts on the operation that produced its operand. ctrl_*[k] is the
@@ -364,15 +436,18 @@ module bf16_multi_mac_tree #(
                         ctrl_valid_q[d] <= 1'b0;
                         ctrl_sel_q[d]   <= '0;
                         ctrl_mode_q[d]  <= 1'b0;
+                        ctrl_ext_q[d]   <= 1'b0;
                     end
                 end else begin
                     ctrl_valid_q[0] <= enable;
                     ctrl_sel_q[0]   <= accumulator_select;
                     ctrl_mode_q[0]  <= effective_mode;
+                    ctrl_ext_q[0]   <= tree_idle;
                     for (int unsigned d = 1; d < CONTROL_DEPTH; d++) begin
                         ctrl_valid_q[d] <= ctrl_valid_q[d-1];
                         ctrl_sel_q[d]   <= ctrl_sel_q[d-1];
                         ctrl_mode_q[d]  <= ctrl_mode_q[d-1];
+                        ctrl_ext_q[d]   <= ctrl_ext_q[d-1];
                     end
                 end
             end
@@ -381,6 +456,7 @@ module bf16_multi_mac_tree #(
                 ctrl_valid_q[0] = 1'b0;
                 ctrl_sel_q[0]   = '0;
                 ctrl_mode_q[0]  = 1'b0;
+                ctrl_ext_q[0]   = 1'b0;
             end
         end
     endgenerate
@@ -390,6 +466,12 @@ module bf16_multi_mac_tree #(
                                              : effective_mode;
         result_mode = (PIPELINE_STAGES == 0) ? effective_mode
                                              : ctrl_mode_q[PIPELINE_STAGES-1];
+        // Same tap as result_mode: the source select must belong to the
+        // operation whose result is being captured, not to the live input.
+        result_external = (PIPELINE_STAGES == 0)
+                          ? tree_idle : ctrl_ext_q[PIPELINE_STAGES-1];
+        ext_at_result   = (PIPELINE_STAGES == 0)
+                          ? external_operand : ext_delay[PIPELINE_STAGES-1];
     end
 
     always_comb begin

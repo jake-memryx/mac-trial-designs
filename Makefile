@@ -7,6 +7,7 @@ GENUS ?= genus
 	test-bf16-multi-mac-tree test-bf16-mama-gemv \
 	test-bf16-multi-mac-tree-gemv test-fp8-mac \
 	test-bf16-multi-mac-tree-mode test-bf16-multi-mac-tree-fp8-gemv \
+	test-bf16-multi-mac-tree-chain \
 	cln4p-libs synth synth-bf16-mac \
 	synth-bf16-mama synth-bf16-multi-mac-tree power-bf16-multi-mac-tree \
 	breakdown-bf16-multi-mac-tree vcd-bf16-mama-gemv \
@@ -18,7 +19,9 @@ all: test
 test: test-counter test-bf16-mac test-bf16-mam test-bf16-mama \
 	test-bf16-multi-mac-tree test-bf16-mama-gemv \
 	test-bf16-multi-mac-tree-gemv test-fp8-mac \
-	test-bf16-multi-mac-tree-mode test-bf16-multi-mac-tree-fp8-gemv
+	test-bf16-multi-mac-tree-mode test-bf16-multi-mac-tree-fp8-gemv \
+	test-bf16-multi-mac-tree-chain \
+	test-bf16-multi-mac-tree-chain
 
 sim test-counter:
 	@mkdir -p build/sim
@@ -84,6 +87,14 @@ test-bf16-multi-mac-tree-mode:
 		-top bf16_multi_mac_tree_mode_tb \
 		-xmlibdirname build/sim_mode/xcelium.d \
 		-logfile build/sim_mode/xrun.log
+
+# Two chained units folding a neighbour's accumulator 0 across a depth split.
+test-bf16-multi-mac-tree-chain:
+	@mkdir -p build/sim_chain
+	$(XRUN) -64bit -sv -f sim/bf16_multi_mac_tree_chain_files.f \
+		-top bf16_multi_mac_tree_chain_tb \
+		-xmlibdirname build/sim_chain/xcelium.d \
+		-logfile build/sim_chain/xrun.log
 
 test-bf16-multi-mac-tree-fp8-gemv:
 	@mkdir -p build/sim_fp8_gemv
@@ -184,9 +195,11 @@ TREE_ACC             ?= 2
 # which activity dump drives the power report: fp8 (16 MACs/cycle) or bf16.
 TREE_FP8             ?= 0
 TREE_MODE            ?= fp8
+# TREE_EXT=1 builds the external-accumulate chaining feature.
+TREE_EXT             ?= 0
 
 ifeq ($(TREE_FP8),1)
-TREE_DIR       = build/synth_tree_a$(TREE_ACC)_fp8
+TREE_DIR       = build/synth_tree_a$(TREE_ACC)_fp8_e$(TREE_EXT)
 ifeq ($(TREE_MODE),bf16)
 TREE_VCD       = build/vcd/bf16_multi_mac_tree_gemv_dual_p$(TREE_PIPELINE_STAGES)a$(TREE_ACC)_$(TREE_PERIOD_PS)ps.vcd
 TREE_VCD_SCOPE = bf16_multi_mac_tree_gemv_tb/dut
@@ -195,7 +208,7 @@ TREE_VCD       = build/vcd/bf16_multi_mac_tree_fp8_gemv_p$(TREE_PIPELINE_STAGES)
 TREE_VCD_SCOPE = bf16_multi_mac_tree_fp8_gemv_tb/dut
 endif
 else
-TREE_DIR       = build/synth_tree_a$(TREE_ACC)
+TREE_DIR       = build/synth_tree_a$(TREE_ACC)_e$(TREE_EXT)
 TREE_VCD       = build/vcd/bf16_multi_mac_tree_gemv_p$(TREE_PIPELINE_STAGES)a$(TREE_ACC)_$(TREE_PERIOD_PS)ps.vcd
 TREE_VCD_SCOPE = bf16_multi_mac_tree_gemv_tb/dut
 endif
@@ -208,6 +221,7 @@ synth-bf16-multi-mac-tree: cln4p-libs
 		TREE_PIPELINE_STAGES=$(TREE_PIPELINE_STAGES) \
 		TREE_ACCUMULATE_STAGES=$(TREE_ACC) \
 		TREE_FP8=$(TREE_FP8) \
+		TREE_EXT=$(TREE_EXT) \
 		TREE_VCD_SCOPE=$(TREE_VCD_SCOPE) \
 		TREE_VCD=../../$(TREE_VCD) \
 		$(GENUS) -batch \
@@ -223,6 +237,7 @@ power-bf16-multi-mac-tree: cln4p-libs
 		TREE_PIPELINE_STAGES=$(TREE_PIPELINE_STAGES) \
 		TREE_ACCUMULATE_STAGES=$(TREE_ACC) \
 		TREE_FP8=$(TREE_FP8) \
+		TREE_EXT=$(TREE_EXT) \
 		TREE_VCD_SCOPE=$(TREE_VCD_SCOPE) \
 		TREE_VCD=../../$(TREE_VCD) \
 		$(GENUS) -batch \
@@ -240,6 +255,7 @@ breakdown-bf16-multi-mac-tree: cln4p-libs
 		TREE_PIPELINE_STAGES=$(TREE_PIPELINE_STAGES) \
 		TREE_ACCUMULATE_STAGES=$(TREE_ACC) \
 		TREE_FP8=$(TREE_FP8) \
+		TREE_EXT=$(TREE_EXT) \
 		TREE_VCD_SCOPE=$(TREE_VCD_SCOPE) \
 		TREE_VCD=../../$(TREE_VCD) \
 		$(GENUS) -batch \

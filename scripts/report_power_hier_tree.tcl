@@ -13,9 +13,10 @@ set stages     [expr {[info exists env(TREE_PIPELINE_STAGES)] ?
 set acc_stages [expr {[info exists env(TREE_ACCUMULATE_STAGES)] ?
                       $env(TREE_ACCUMULATE_STAGES) : 2}]
 set fp8 [expr {[info exists env(TREE_FP8)] ? $env(TREE_FP8) : 0}]
+set ext [expr {[info exists env(TREE_EXT)] ? $env(TREE_EXT) : 0}]
 set vcd_scope [expr {[info exists env(TREE_VCD_SCOPE)] ?
                      $env(TREE_VCD_SCOPE) : "bf16_multi_mac_tree_gemv_tb/dut"}]
-set top bf16_multi_mac_tree_MULTIPLIERS8_ACCUMULATORS32_REDUCTION_GUARD_BITS4_FP8_ENABLE${fp8}_PIPELINE_STAGES${stages}_ACCUMULATE_STAGES$acc_stages
+set top bf16_multi_mac_tree_MULTIPLIERS8_ACCUMULATORS32_REDUCTION_GUARD_BITS4_FP8_ENABLE${fp8}_EXTERNAL_ACCUMULATE${ext}_PIPELINE_STAGES${stages}_ACCUMULATE_STAGES$acc_stages
 
 read_hdl -netlist breakdown_mapped.sv
 elaborate $top

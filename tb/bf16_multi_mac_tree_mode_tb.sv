@@ -21,6 +21,7 @@ module bf16_multi_mac_tree_mode_tb;
     localparam logic [31:0] FP32_FOUR   = 32'h40800000;
     localparam logic [31:0] FP32_EIGHT  = 32'h41000000;
     localparam logic [31:0] FP32_TWELVE = 32'h41400000;
+    localparam logic [31:0] FP32_TWO    = 32'h40000000;
 
     logic                    clk;
     logic                    reset;
@@ -30,6 +31,9 @@ module bf16_multi_mac_tree_mode_tb;
     logic [SELECT_WIDTH-1:0] accumulator_select;
     logic [15:0]             a [0:MULTIPLIERS-1];
     logic [15:0]             b [0:MULTIPLIERS-1];
+    logic                    external_select;
+    logic [31:0]             external_operand;
+    logic [31:0]             chain_out;
     logic [31:0]             accumulator;
     int                      failures = 0;
 
@@ -38,6 +42,7 @@ module bf16_multi_mac_tree_mode_tb;
         .ACCUMULATORS         (ACCUMULATORS),
         .REDUCTION_GUARD_BITS (4),
         .FP8_ENABLE           (1),
+        .EXTERNAL_ACCUMULATE  (1),
         .PIPELINE_STAGES      (PIPELINE_STAGES),
         .ACCUMULATE_STAGES    (ACCUMULATE_STAGES)
     ) dut (.*);
@@ -59,9 +64,29 @@ module bf16_multi_mac_tree_mode_tb;
         @(negedge clk);
         load_ones(fp8);
         mode               = fp8;
+        external_select    = 1'b0;
         accumulator_select = select;
         enable             = 1'b1;
         @(posedge clk);
+    endtask
+
+    // Issue an external accumulate on the next cycle.
+    task automatic issue_external(input logic [31:0] value,
+                                  input logic [SELECT_WIDTH-1:0] select);
+        @(negedge clk);
+        external_operand   = value;
+        external_select    = 1'b1;
+        accumulator_select = select;
+        enable             = 1'b1;
+        @(posedge clk);
+    endtask
+
+    task automatic pulse_clear();
+        @(negedge clk);
+        clear = 1'b1;
+        @(posedge clk);
+        @(negedge clk);
+        clear = 1'b0;
     endtask
 
     task automatic drain();
@@ -91,6 +116,8 @@ module bf16_multi_mac_tree_mode_tb;
         clear              = 1'b0;
         enable             = 1'b0;
         mode               = 1'b0;
+        external_select    = 1'b0;
+        external_operand   = 32'b0;
         accumulator_select = '0;
         load_ones(0);
 
@@ -133,6 +160,25 @@ module bf16_multi_mac_tree_mode_tb;
 
         // Unused accumulator stays clear throughout.
         expect_acc(3'd7, 32'h00000000, "untouched accumulator");
+
+        // External accumulates interleaved with tree operations on consecutive
+        // cycles. The source select has to travel with each operation, exactly
+        // as the format mode does.
+        pulse_clear();
+        issue(0, 3'd0);                      // BF16 tree -> 4.0
+        issue_external(FP32_TWO, 3'd1);      // external  -> 2.0
+        issue(1, 3'd2);                      // E4M3 tree -> 8.0
+        issue_external(FP32_TWO, 3'd3);      // external  -> 2.0
+        drain();
+        expect_acc(3'd0, FP32_FOUR,  "interleaved BF16 (4.0)");
+        expect_acc(3'd1, FP32_TWO,   "interleaved external (2.0)");
+        expect_acc(3'd2, FP32_EIGHT, "interleaved E4M3 (8.0)");
+        expect_acc(3'd3, FP32_TWO,   "interleaved external again (2.0)");
+
+        // An external accumulate folds into an existing accumulator value.
+        issue_external(FP32_TWO, 3'd0);
+        drain();
+        expect_acc(3'd0, 32'h40c00000, "external onto BF16 result (6.0)");
 
         if (failures == 0) begin
             $display("\nBF16 MULTI-MAC TREE MODE TEST PASSED");
