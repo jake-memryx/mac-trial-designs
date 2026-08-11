@@ -7,7 +7,7 @@ GENUS ?= genus
 	test-bf16-multi-mac-tree test-bf16-mama-gemv \
 	test-bf16-multi-mac-tree-gemv test-fp8-mac \
 	test-bf16-multi-mac-tree-mode test-bf16-multi-mac-tree-fp8-gemv \
-	test-bf16-multi-mac-tree-chain \
+	test-bf16-multi-mac-tree-chain test-mcore \
 	cln4p-libs synth synth-bf16-mac \
 	synth-bf16-mama synth-bf16-multi-mac-tree power-bf16-multi-mac-tree \
 	breakdown-bf16-multi-mac-tree vcd-bf16-mama-gemv \
@@ -95,6 +95,15 @@ test-bf16-multi-mac-tree-chain:
 		-top bf16_multi_mac_tree_chain_tb \
 		-xmlibdirname build/sim_chain/xcelium.d \
 		-logfile build/sim_chain/xrun.log
+
+# Matrix Core bring-up smoke test: structural constants, reset state and the
+# stage command/data channel wiring.
+test-mcore:
+	@mkdir -p build/sim_mcore
+	$(XRUN) -64bit -sv -f sim/mcore_files.f \
+		-top mcore_tb \
+		-xmlibdirname build/sim_mcore/xcelium.d \
+		-logfile build/sim_mcore/xrun.log
 
 test-bf16-multi-mac-tree-fp8-gemv:
 	@mkdir -p build/sim_fp8_gemv
