@@ -288,6 +288,40 @@ and still did not close 1x, because the multicycle relaxation was spent on the
 multiply/align/reduce cone, which had slack, while the accumulate loop remained
 the limiter. Pipelining that loop directly is the cheaper and effective fix.
 
+## Matrix Core
+
+`rtl/mcore/` implements the Matrix Core specified in `matrix_core.md`: a
+four-stage `Command -> Fetch -> Compute -> Writeback` machine around four
+TreeMAC lanes and 64 FP32 accumulators, with two memory ports (512-bit LoMem,
+128-bit CoMem) and a 19-instruction ISA. Run its tests with `make test-mcore`.
+
+The arithmetic is not new. `mcore_treemac` is the datapath of
+`bf16_multi_mac_tree` reassembled from the same submodules — eight
+`bf16_multiplier`, `bf16_mac_tree_align`, `bf16_mac_tree_normalize` and
+`fp32_adder` — with an accumulator bank that adds the three views the ISA needs:
+an arbitrary FP32 write for `load_accumulators`, a bulk clear for `acc_reset`,
+and a combinational read port for the Compute→WB snapshot. Writeback's FPU is
+the existing `bf16_add` and `bf16_mul`, one instance each, shared sequentially.
+
+Two design points worth noting:
+
+- The accumulate loop is deliberately **flat** here, not pipelined like the
+  synthesis-tuned `bf16_multi_mac_tree`. Pipelining that loop is only legal for
+  round-robin accumulator selection, and `multi_mac` and the elementwise
+  operations revisit accumulator 0 on consecutive cycles. The pipelined loop is
+  still available for a `broadcast_mac`-only build, where the accumulator index
+  is the column group.
+- Memory requests carry a **ticket** whose top bit says whether Fetch or
+  Writeback issued them, so both share one port per domain and reads may
+  complete out of order. `make test-mcore-reorder` runs the whole suite with
+  responses returned in reverse order to prove nothing depends on ordering.
+
+The testbench drives the top level only — program memory, two behavioral
+memories, `start`/`done` — and checks program-visible memory against a `real`
+reference. 352 checks pass in both response orderings. `MCORE_ARGS='+only=ew'`
+runs one group and `'+trace'` logs every stage dispatch and completion; the
+groups are `ctrl`, `acc`, `bcast`, `int8`, `multi`, `ew`, `buf`, `scale`, `dep`.
+
 ## Clean generated files
 
 ```sh

@@ -7,8 +7,8 @@ GENUS ?= genus
 	test-bf16-multi-mac-tree test-bf16-mama-gemv \
 	test-bf16-multi-mac-tree-gemv test-fp8-mac \
 	test-bf16-multi-mac-tree-mode test-bf16-multi-mac-tree-fp8-gemv \
-	test-bf16-multi-mac-tree-chain test-mcore test-bf16-arith \
-	cln4p-libs synth synth-bf16-mac \
+	test-bf16-multi-mac-tree-chain test-mcore test-mcore-reorder \
+	test-bf16-arith cln4p-libs synth synth-bf16-mac \
 	synth-bf16-mama synth-bf16-multi-mac-tree power-bf16-multi-mac-tree \
 	breakdown-bf16-multi-mac-tree vcd-bf16-mama-gemv \
 	synth-bf16-add synth-bf16-mul synth-reg-512 synth-reg-512-noen \
@@ -21,8 +21,7 @@ test: test-counter test-bf16-mac test-bf16-mam test-bf16-mama \
 	test-bf16-multi-mac-tree test-bf16-mama-gemv \
 	test-bf16-multi-mac-tree-gemv test-fp8-mac \
 	test-bf16-multi-mac-tree-mode test-bf16-multi-mac-tree-fp8-gemv \
-	test-bf16-multi-mac-tree-chain \
-	test-bf16-multi-mac-tree-chain
+	test-bf16-multi-mac-tree-chain test-bf16-arith test-mcore
 
 sim test-counter:
 	@mkdir -p build/sim
@@ -105,14 +104,29 @@ test-bf16-arith:
 		-xmlibdirname build/sim_bf16_arith/xcelium.d \
 		-logfile build/sim_bf16_arith/xrun.log
 
-# Matrix Core bring-up smoke test: structural constants, reset state and the
-# stage command/data channel wiring.
+# Matrix Core end to end: control flow, all eleven dataflow instructions against
+# a real-valued reference, range dependencies and the drain rule.
+#
+# MCORE_ARGS passes plusargs through: '+only=<group>' runs one group (ctrl, acc,
+# bcast, int8, multi, ew, buf, scale, dep), '+trace' logs every stage dispatch
+# and completion, '+mem_reorder' returns read responses out of order so the
+# ticket matching is exercised.
+MCORE_ARGS ?=
+
 test-mcore:
 	@mkdir -p build/sim_mcore
 	$(XRUN) -64bit -sv -f sim/mcore_files.f \
-		-top mcore_tb \
+		-top mcore_tb $(MCORE_ARGS) \
 		-xmlibdirname build/sim_mcore/xcelium.d \
 		-logfile build/sim_mcore/xrun.log
+
+# The same suite with out-of-order read responses.
+test-mcore-reorder:
+	@mkdir -p build/sim_mcore
+	$(XRUN) -64bit -sv -f sim/mcore_files.f \
+		-top mcore_tb +mem_reorder \
+		-xmlibdirname build/sim_mcore/xcelium.d \
+		-logfile build/sim_mcore/xrun_reorder.log
 
 test-bf16-multi-mac-tree-fp8-gemv:
 	@mkdir -p build/sim_fp8_gemv

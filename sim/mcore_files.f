@@ -1,9 +1,17 @@
+rtl/bf16_mac.sv
+rtl/bf16_mac_tree_core.sv
+rtl/bf16_add.sv
+rtl/bf16_mul.sv
 rtl/mcore/mcore_pkg.sv
 rtl/mcore/mcore_fifo.sv
+rtl/mcore/mcore_read_buffer.sv
+rtl/mcore/mcore_treemac.sv
 rtl/mcore/mcore_cmd.sv
 rtl/mcore/mcore_fetch.sv
 rtl/mcore/mcore_compute.sv
 rtl/mcore/mcore_writeback.sv
+rtl/mcore/mcore_memport.sv
 rtl/mcore/mcore.sv
 tb/mcore_prog_pkg.sv
+tb/mcore_mem_model.sv
 tb/mcore_tb.sv
