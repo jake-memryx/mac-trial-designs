@@ -7,10 +7,11 @@ GENUS ?= genus
 	test-bf16-multi-mac-tree test-bf16-mama-gemv \
 	test-bf16-multi-mac-tree-gemv test-fp8-mac \
 	test-bf16-multi-mac-tree-mode test-bf16-multi-mac-tree-fp8-gemv \
-	test-bf16-multi-mac-tree-chain test-mcore \
+	test-bf16-multi-mac-tree-chain test-mcore test-bf16-arith \
 	cln4p-libs synth synth-bf16-mac \
 	synth-bf16-mama synth-bf16-multi-mac-tree power-bf16-multi-mac-tree \
 	breakdown-bf16-multi-mac-tree vcd-bf16-mama-gemv \
+	synth-bf16-add synth-bf16-mul synth-reg-512 synth-reg-512-noen \
 	vcd-bf16-multi-mac-tree-gemv licenses clean
 
 all: test
@@ -95,6 +96,14 @@ test-bf16-multi-mac-tree-chain:
 		-top bf16_multi_mac_tree_chain_tb \
 		-xmlibdirname build/sim_chain/xcelium.d \
 		-logfile build/sim_chain/xrun.log
+
+# Standalone BF16 adder and multiplier against a double-precision reference.
+test-bf16-arith:
+	@mkdir -p build/sim_bf16_arith
+	$(XRUN) -64bit -sv -f sim/bf16_arith_files.f \
+		-top bf16_arith_tb \
+		-xmlibdirname build/sim_bf16_arith/xcelium.d \
+		-logfile build/sim_bf16_arith/xrun.log
 
 # Matrix Core bring-up smoke test: structural constants, reset state and the
 # stage command/data channel wiring.
@@ -275,3 +284,27 @@ licenses:
 
 clean:
 	rm -rf build
+
+# Standalone area/timing characterization of one BF16 adder and one BF16
+# multiplier. The virtual clock period is tight on purpose so the reported
+# negative slack gives the achievable combinational delay.
+synth-bf16-add:
+	@mkdir -p build/synth_bf16_add
+	cd build/synth_bf16_add && BF16_UNIT=bf16_add BF16_PERIOD=0.2 \
+		$(GENUS) -no_gui -f ../../scripts/synth_bf16_arith.tcl
+
+synth-bf16-mul:
+	@mkdir -p build/synth_bf16_mul
+	cd build/synth_bf16_mul && BF16_UNIT=bf16_mul BF16_PERIOD=0.2 \
+		$(GENUS) -no_gui -f ../../scripts/synth_bf16_arith.tcl
+
+# Flat register buffer area, with and without an enable-gated load.
+synth-reg-512:
+	@mkdir -p build/synth_reg_512b_e1
+	cd build/synth_reg_512b_e1 && REG_WIDTH=512 REG_ENABLE=1 REG_PERIOD=0.666667 \
+		$(GENUS) -no_gui -f ../../scripts/synth_reg_buffer.tcl
+
+synth-reg-512-noen:
+	@mkdir -p build/synth_reg_512b_e0
+	cd build/synth_reg_512b_e0 && REG_WIDTH=512 REG_ENABLE=0 REG_PERIOD=0.666667 \
+		$(GENUS) -no_gui -f ../../scripts/synth_reg_buffer.tcl
