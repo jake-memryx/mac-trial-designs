@@ -132,10 +132,11 @@ module mcore_writeback
     logic                                  store_to_comem;
     logic                                  store_accepted;
 
-    logic [31:0]                           line_index_wide;
-    logic [31:0]                           scale_block_wide;
-    logic signed [INT_WIDTH-1:0]           store_index;
-    logic signed [INT_WIDTH-1:0]           scale_index;
+    // Output lines and scale rows are consumed in order, so their addresses are
+    // running views stepped once per accepted access rather than recomputed
+    // from a line number (section 15).
+    stream_view_t                          out_view_q;
+    stream_view_t                          scale_view_q;
     logic [MEM_ROW_WIDTH-1:0]              store_row;
     logic [MEM_ROW_WIDTH-1:0]              scale_row;
     logic [LANE_SELECT_WIDTH-1:0]          store_lane;
@@ -195,16 +196,12 @@ module mcore_writeback
     // Output lines are consecutive accesses of view_out. Scale rows are whole
     // 512-bit LoMem rows, so their address is generated with wide_row set
     // (section 15); output lines are 128-bit accesses, so wide_row is clear.
-    assign line_index_wide  = {{32-LINE_IDX_WIDTH{1'b0}}, line_index_q};
-    assign scale_block_wide =
-        {{32-VALUE_IDX_WIDTH+SCALE_IDX_WIDTH{1'b0}},
-         value_index_q[VALUE_IDX_WIDTH-1:SCALE_IDX_WIDTH]};
-
-    assign store_index = stream_index_ahead(cmd_q.view_out, line_index_wide);
-    assign scale_index = stream_index_ahead(cmd_q.view_scale, scale_block_wide);
-    assign store_row   = stream_row(cmd_q.view_out.desc, store_index, 1'b0);
-    assign store_lane  = stream_lane(cmd_q.view_out.desc, store_index, 1'b0);
-    assign scale_row   = stream_row(cmd_q.view_scale.desc, scale_index, 1'b1);
+    assign store_row  = stream_row(out_view_q.desc, stream_addr(out_view_q),
+                                   1'b0);
+    assign store_lane = stream_lane(out_view_q.desc, stream_addr(out_view_q),
+                                    1'b0);
+    assign scale_row  = stream_row(scale_view_q.desc,
+                                   stream_addr(scale_view_q), 1'b1);
 
     assign store_to_comem = (cmd_q.view_out.desc.domain == DOMAIN_COMEM);
     assign store_accepted = (state_q == WB_STORE) &&
@@ -260,6 +257,8 @@ module mcore_writeback
             value_index_q  <= '0;
             line_index_q   <= '0;
             pack_index_q   <= '0;
+            out_view_q     <= '0;
+            scale_view_q   <= '0;
             seq_error_q    <= 1'b0;
         end else if (flush) begin
             state_q       <= WB_IDLE;
@@ -275,6 +274,8 @@ module mcore_writeback
                         value_index_q <= '0;
                         line_index_q  <= '0;
                         pack_index_q  <= '0;
+                        out_view_q    <= cmd.view_out;
+                        scale_view_q  <= cmd.view_scale;
                         if (cmd.op == WB_WRITE_BUF) begin
                             // A command is only accepted while the stage is
                             // idle, so an earlier reduction has already written
@@ -316,6 +317,7 @@ module mcore_writeback
                 end
                 WB_SCALE_FETCH: begin
                     if (lomem_req_ready) begin
+                        scale_view_q <= stream_step(scale_view_q);
                         // A zero-latency memory model can return the row in the
                         // cycle the read is accepted.
                         if (scale_response) begin
@@ -346,6 +348,7 @@ module mcore_writeback
                         line_index_q <= line_index_q + LINE_IDX_WIDTH'(1'b1);
                         pack_index_q <= '0;
                         line_q       <= '0;
+                        out_view_q   <= stream_step(out_view_q);
                         unique case (cmd_q.op)
                             WB_WRITE_ACC:
                                 state_q <=

@@ -31,7 +31,7 @@ package mcore_pkg;
     // ---------------------------------------------------------------- section 11
     // Implementation parameters.
     parameter int unsigned SCALE_BUFFER_ENTRIES = 32;
-    parameter int unsigned COMMAND_Q_DEPTH      = 4;
+    parameter int unsigned COMMAND_Q_DEPTH      = 2;
     parameter int unsigned DATA_Q_DEPTH         = 2;
     parameter int unsigned MEMORY_Q_DEPTH       = 12;
     parameter int unsigned FETCH_BUFFER_DEPTH   = 4;
@@ -45,7 +45,16 @@ package mcore_pkg;
     parameter int unsigned TICKET_WIDTH         = 5;
     parameter int unsigned RESERVATIONS         = 4;
     parameter int unsigned COUNT_WIDTH          = 7;
-    parameter int unsigned SETSTREAM_WORDS      = 4;
+    parameter int unsigned SETSTREAM_WORDS      = 2;
+
+    // Stream arithmetic widths. A logical stream index addresses 128-bit lines
+    // or 512-bit rows within a 16-bit row space, so 22 bits covers every
+    // addressable line with room for signed intermediates; counts and strides
+    // are 16-bit. The integer registers stay 32-bit (section 1), so a
+    // register-sourced stream field is truncated to its field width.
+    parameter int unsigned STREAM_ADDR_WIDTH   = 22;
+    parameter int unsigned STREAM_COUNT_WIDTH  = 16;
+    parameter int unsigned STREAM_STRIDE_WIDTH = 16;
 
     // Widest access count a single command advances a stream by: eight 128-bit
     // lines cover the 64 values of write_accumulators and scale_accumulators.
@@ -193,10 +202,37 @@ package mcore_pkg;
     endfunction
 
     // Bit 4 = offset, 3 = inner_count, 2 = outer_count, 1 = inner_stride,
-    // 0 = outer_stride. A selected field carries a register index instead of a
-    // literal.
+    // 0 = outer_stride. A selected field carries a register index in its low
+    // four bits instead of a literal.
     function automatic logic [4:0] setstream_reg_select(instr_t w);
         return w[35:31];
+    endfunction
+
+    // set_stream word 0 also carries the offset; word 1 carries the four
+    // counts and strides (section 12).
+    function automatic logic signed [STREAM_ADDR_WIDTH-1:0]
+            setstream_offset(instr_t w);
+        return $signed(w[30:9]);
+    endfunction
+
+    function automatic logic [STREAM_COUNT_WIDTH-1:0]
+            setstream_inner_count(instr_t w);
+        return w[63:48];
+    endfunction
+
+    function automatic logic [STREAM_COUNT_WIDTH-1:0]
+            setstream_outer_count(instr_t w);
+        return w[47:32];
+    endfunction
+
+    function automatic logic signed [STREAM_STRIDE_WIDTH-1:0]
+            setstream_inner_stride(instr_t w);
+        return $signed(w[31:16]);
+    endfunction
+
+    function automatic logic signed [STREAM_STRIDE_WIDTH-1:0]
+            setstream_outer_stride(instr_t w);
+        return $signed(w[15:0]);
     endfunction
 
     function automatic logic signed [INT_WIDTH-1:0] instr_high_word(instr_t w);
@@ -208,68 +244,74 @@ package mcore_pkg;
     endfunction
 
     // ------------------------------------------------- section 15: stream state
+    // The descriptor holds no offset: the offset is only the initial value of
+    // the cursor address, and the cursor is part of the view.
+    //
+    // `contiguous` replaces the specified default `outer_stride =
+    // inner_count * inner_stride`. When an outer iteration ends, the next one
+    // starts at the last inner address plus inner_stride, which is the same
+    // address the product would have produced, so the hardware never multiplies
+    // (section 15).
     typedef struct packed {
-        logic                        valid;
-        mem_domain_e                 domain;
-        layout_e                     layout;
-        logic [MEM_ROW_WIDTH-1:0]    base_row;
-        logic signed [INT_WIDTH-1:0] offset;
-        logic signed [INT_WIDTH-1:0] inner_count;
-        logic signed [INT_WIDTH-1:0] outer_count;
-        logic signed [INT_WIDTH-1:0] inner_stride;
-        logic signed [INT_WIDTH-1:0] outer_stride;
+        logic                                  valid;
+        mem_domain_e                           domain;
+        layout_e                               layout;
+        logic [MEM_ROW_WIDTH-1:0]              base_row;
+        logic [STREAM_COUNT_WIDTH-1:0]         inner_count;
+        logic [STREAM_COUNT_WIDTH-1:0]         outer_count;
+        logic signed [STREAM_STRIDE_WIDTH-1:0] inner_stride;
+        logic signed [STREAM_STRIDE_WIDTH-1:0] outer_stride;
+        logic                                  contiguous;
     } stream_desc_t;
 
+    // A view is a descriptor plus the position of the next access. `addr` is
+    // that access's logical index and `outer_base` is the index the current
+    // outer iteration started from, both maintained incrementally.
     typedef struct packed {
-        stream_desc_t                desc;
-        logic signed [INT_WIDTH-1:0] inner_cursor;
-        logic signed [INT_WIDTH-1:0] outer_cursor;
+        stream_desc_t                        desc;
+        logic [STREAM_COUNT_WIDTH-1:0]       inner_cursor;
+        logic [STREAM_COUNT_WIDTH-1:0]       outer_cursor;
+        logic signed [STREAM_ADDR_WIDTH-1:0] addr;
+        logic signed [STREAM_ADDR_WIDTH-1:0] outer_base;
     } stream_view_t;
 
-    // Logical index of the access the cursors currently point at.
-    function automatic logic signed [INT_WIDTH-1:0] stream_index(
+    function automatic logic signed [STREAM_ADDR_WIDTH-1:0] stride_extend(
+            logic signed [STREAM_STRIDE_WIDTH-1:0] s);
+        return $signed({{(STREAM_ADDR_WIDTH-STREAM_STRIDE_WIDTH)
+                         {s[STREAM_STRIDE_WIDTH-1]}}, s});
+    endfunction
+
+    // Logical index of the access the view points at. No arithmetic: the
+    // address is state.
+    function automatic logic signed [STREAM_ADDR_WIDTH-1:0] stream_addr(
             stream_view_t v);
-        return v.desc.offset +
-               v.outer_cursor * v.desc.outer_stride +
-               v.inner_cursor * v.desc.inner_stride;
+        return v.addr;
     endfunction
 
-    // Logical index of an access n steps ahead of the cursors, used to size a
-    // range reservation without walking the cursors.
-    function automatic logic signed [INT_WIDTH-1:0] stream_index_ahead(
-            stream_view_t v, int unsigned n);
-        stream_view_t walk;
-        walk = v;
-        for (int unsigned s = 0; s < MAX_STREAM_ACCESSES; s++) begin
-            if (s < n) begin
-                walk.inner_cursor = walk.inner_cursor + 1;
-                if (walk.inner_cursor >= walk.desc.inner_count) begin
-                    walk.inner_cursor = '0;
-                    walk.outer_cursor = walk.outer_cursor + 1;
-                end
-            end
-        end
-        return stream_index(walk);
-    endfunction
-
-    // One consumption advances the inner cursor and wraps into the outer one.
-    function automatic stream_view_t stream_advance(stream_view_t v,
-                                                    int unsigned accesses);
+    // One consumption. Two adds and one compare, whatever the strides are.
+    function automatic stream_view_t stream_step(stream_view_t v);
         stream_view_t next;
-        next = v;
-        for (int unsigned s = 0; s < MAX_STREAM_ACCESSES; s++) begin
-            if (s < accesses) begin
-                next.inner_cursor = next.inner_cursor + 1;
-                if (next.inner_cursor >= next.desc.inner_count) begin
-                    next.inner_cursor = '0;
-                    next.outer_cursor = next.outer_cursor + 1;
-                end
-            end
+        logic signed [STREAM_ADDR_WIDTH-1:0] wrapped;
+        next    = v;
+        wrapped = v.desc.contiguous ? (v.addr + stride_extend(v.desc.inner_stride))
+                                    : (v.outer_base +
+                                       stride_extend(v.desc.outer_stride));
+        if ((v.inner_cursor + STREAM_COUNT_WIDTH'(1'b1)) >= v.desc.inner_count)
+        begin
+            next.inner_cursor = '0;
+            next.outer_cursor = v.outer_cursor + STREAM_COUNT_WIDTH'(1'b1);
+            next.outer_base   = wrapped;
+            next.addr         = wrapped;
+        end else begin
+            next.inner_cursor = v.inner_cursor + STREAM_COUNT_WIDTH'(1'b1);
+            next.addr         = v.addr + stride_extend(v.desc.inner_stride);
         end
         return next;
     endfunction
 
-    // broadcast_mac and multi_mac consume their streams completely.
+    // broadcast_mac and multi_mac consume their streams completely. Reusing an
+    // exhausted stream is an illegal program, so the address state is left
+    // where it stopped.
     function automatic stream_view_t stream_exhaust(stream_view_t v);
         stream_view_t next;
         next = v;
@@ -282,7 +324,8 @@ package mcore_pkg;
     // indexing multi_mac and scale_accumulators use on a ROW_MAJOR LoMem
     // stream; otherwise LoMem is indexed in 128-bit lines, four to a row.
     function automatic logic [MEM_ROW_WIDTH-1:0] stream_row(
-            stream_desc_t d, logic signed [INT_WIDTH-1:0] q, logic wide_row);
+            stream_desc_t d, logic signed [STREAM_ADDR_WIDTH-1:0] q,
+            logic wide_row);
         logic [MEM_ROW_WIDTH-1:0] step;
         if (d.domain == DOMAIN_COMEM)
             step = q[MEM_ROW_WIDTH-1:0];
@@ -296,7 +339,8 @@ package mcore_pkg;
 
     // Lane within a 512-bit LoMem row for a 128-bit line access.
     function automatic logic [LANE_SELECT_WIDTH-1:0] stream_lane(
-            stream_desc_t d, logic signed [INT_WIDTH-1:0] q, logic wide_row);
+            stream_desc_t d, logic signed [STREAM_ADDR_WIDTH-1:0] q,
+            logic wide_row);
         if (d.domain == DOMAIN_COMEM || wide_row ||
             d.layout == LAYOUT_MATMUL_B || d.layout == LAYOUT_MATMUL_B_INT8)
             return '0;

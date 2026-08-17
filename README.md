@@ -303,7 +303,19 @@ an arbitrary FP32 write for `load_accumulators`, a bulk clear for `acc_reset`,
 and a combinational read port for the Compute→WB snapshot. Writeback's FPU is
 the existing `bf16_add` and `bf16_mul`, one instance each, shared sequentially.
 
-Two design points worth noting:
+**The core contains no multiplier outside the TreeMAC lanes.** The specified
+address formula `offset + outer*outer_stride + inner*inner_stride` is never
+evaluated: streams are only ever walked in order, so a cursor keeps the address
+itself and each access costs one add. The specified default
+`outer_stride = inner_count*inner_stride` needs no product either, because with
+that default the next outer iteration starts exactly one `inner_stride` past the
+last inner address, so a `contiguous` flag reproduces it exactly. Stream state is
+22-bit addresses with 16-bit counts and strides, against 32-bit integer
+registers, and `set_stream` fits in two instruction words. The Command stage
+walks a multi-access command one access per cycle at issue to get its exact row
+range, which reuses one adder instead of building a parallel walk chain.
+
+Two other design points worth noting:
 
 - The accumulate loop is deliberately **flat** here, not pipelined like the
   synthesis-tuned `bf16_multi_mac_tree`. Pipelining that loop is only legal for
@@ -316,11 +328,80 @@ Two design points worth noting:
   complete out of order. `make test-mcore-reorder` runs the whole suite with
   responses returned in reverse order to prove nothing depends on ordering.
 
+### Trial synthesis
+
+CLN4P, `tt_0p75v_25c_typical`, zero wireload, clock gating on, **hierarchy held**
+(`auto_ungroup none`) so each block stays attributable. 2.0 ns (500 MHz), inputs
+and outputs budgeted 30% of the period because the program memory and both
+memories are off-core. Build with `make synth-mcore`; `MCORE_PERIOD` and
+`MCORE_UNGROUP` select period and whether Genus may dissolve hierarchy.
+
+**79344 cells, 5990.4 um2, 17217 flops (45.0% of area), 213 clock gates, 0 ps
+slack.**
+
+| Block | Area (um2) | Share |
+|---|---:|---:|
+| `compute_stage` | 2525.9 | 42.2% |
+| — 4 × `mcore_treemac` | 2343.6 | 39.1% |
+| — snapshot registers and muxing | 182.3 | 3.0% |
+| `fetch_stage` | 1184.9 | 19.8% |
+| — 2 × `mcore_read_buffer` | 835.6 | 13.9% |
+| — AGU and packet assembly | 349.3 | 5.8% |
+| `command_stage` | 593.3 | 9.9% |
+| `writeback_stage` | 588.7 | 9.8% |
+| — `bf16_add` + `bf16_mul` | 35.2 | 0.6% |
+| `operand_queue` | 467.2 | 7.8% |
+| `result_queue` | 388.2 | 6.5% |
+| `fetch_cmd_queue` + `wb_cmd_queue` + `compute_cmd_queue` | 207.3 | 3.5% |
+| `lomem_port` + `comem_port` | 34.4 | 0.6% |
+
+A lane costs 574-605 um2, against 694 um2 for the standalone
+`bf16_multi_mac_tree` at 1.5 GHz with 32 accumulators and a pipelined loop, so
+the reused datapath costs what it did before.
+
+Three things the split says:
+
+- **The address generator is no longer the story.** The whole Command stage,
+  including the reservation table, the loop stack, the register file and the
+  range walker, is 9.9% of the core and contains no multiplier. The eighteen
+  32x32 multipliers the literal address formula implied would each have been
+  comparable to a `bf16_multiplier`.
+- **After the datapath, the cost is moving operands, not computing on them.**
+  The prefetch buffers and the five FIFOs together are 31.7%, all of it a
+  consequence of a 512-bit operand architecture and the queue depths.
+- **Power in the report is vectorless and carries no weight.** It needs an
+  activity dump from a Matrix Core program, which does not exist yet.
+
+The critical path is
+`operand_queue/read_pointer_reg -> operand FIFO read mux -> multiply -> align ->
+reduce -> normalize -> fp32_adder -> accumulator_bank_reg`: the flat accumulate
+loop of section 10, with the FIFO output mux added in front of it. 500 MHz is
+therefore the flat-loop limit, not a wireload or optimization artifact. Reaching
+the tree MAC's 1.5 GHz needs the pipelined accumulate loop, which is only legal
+when accumulators are selected round-robin — that is, a `broadcast_mac`-only
+build, or an ISA rule that forbids re-issuing an accumulator still in flight.
+
+Area levers in order of value, none of which touch the datapath:
+
+1. The operand packet carries `lhs[4][8]` and `rhs[4][8]`, 1024 bits of BF16,
+   but `broadcast_mac` replicates one A line to all four lanes and elementwise
+   uses two of eight multiplier slots. Carrying A once plus the B row (640 bits)
+   would roughly halve `operand_queue` and shrink packet assembly.
+2. `FETCH_BUFFER_DEPTH` 4 to 2 halves the two read buffers, about 420 um2, at
+   the cost of latency tolerance — worth measuring against real memory latency.
+3. `result_queue` holds two 64-value snapshots although Writeback registers a
+   packet the cycle it accepts one, so depth 1 there saves about 190 um2.
+
+Together that is roughly 15% of the core for no loss of function.
+
+### Verification
+
 The testbench drives the top level only — program memory, two behavioral
 memories, `start`/`done` — and checks program-visible memory against a `real`
-reference. 352 checks pass in both response orderings. `MCORE_ARGS='+only=ew'`
+reference. 387 checks pass in both response orderings. `MCORE_ARGS='+only=ew'`
 runs one group and `'+trace'` logs every stage dispatch and completion; the
-groups are `ctrl`, `acc`, `bcast`, `int8`, `multi`, `ew`, `buf`, `scale`, `dep`.
+groups are `ctrl`, `acc`, `bcast`, `int8`, `multi`, `ew`, `buf`, `scale`,
+`stride`, `dep`.
 
 ## Clean generated files
 

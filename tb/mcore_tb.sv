@@ -179,6 +179,22 @@ module mcore_tb
             emit(words[w]);
     endtask
 
+    // An explicit outer_stride, which takes the non-contiguous wrap path.
+    task automatic emit_stream_strided(input int unsigned id,
+                                       input mem_domain_e domain,
+                                       input layout_e layout,
+                                       input int unsigned base_row,
+                                       input int offset, input int inner_count,
+                                       input int outer_count,
+                                       input int inner_stride,
+                                       input int outer_stride);
+        instr_t words [SETSTREAM_WORDS];
+        asm_set_stream(words, id, domain, layout, base_row, offset, inner_count,
+                       outer_count, inner_stride, 1'b1, outer_stride, 5'b0);
+        for (int unsigned w = 0; w < SETSTREAM_WORDS; w++)
+            emit(words[w]);
+    endtask
+
     // +trace prints every stage dispatch and completion, which is how a
     // sequencing or drain problem is localized.
     logic trace_enabled = 1'b0;
@@ -814,6 +830,63 @@ module mcore_tb
                   $sformatf("scale: final line padding at %0d", e));
     endtask
 
+    // An explicit outer_stride exercises the non-contiguous wrap: the cursor
+    // jumps to outer_base + outer_stride instead of continuing from the last
+    // inner address. Four output lines with inner_count 2 and outer_stride 4
+    // land on lanes 0 and 1 of two rows, leaving lanes 2 and 3 untouched.
+    task automatic test_outer_stride();
+        localparam int unsigned ELEMENTS = 32;
+        real                   a_values [0:ELEMENTS-1];
+        real                   b_values [0:ELEMENTS-1];
+        logic [15:0]           values [0:BF16_PER_LINE-1];
+        real                   expected;
+        logic [LINE_WIDTH-1:0] line;
+        int unsigned           q;
+
+        reset_core();
+        clear_program();
+        clear_out_rows();
+
+        for (int unsigned e = 0; e < ELEMENTS; e++) begin
+            a_values[e] = real'(int'(e % 5) + 1) * 0.5;
+            b_values[e] = real'(int'(e % 3) + 1) * 0.25;
+        end
+        for (int unsigned l = 0; l < 4; l++) begin
+            for (int unsigned e = 0; e < BF16_PER_LINE; e++)
+                values[e] = real_to_bf16(a_values[l*8 + e]);
+            write_lomem_line(A_ROW, l, pack_line(values));
+            for (int unsigned e = 0; e < BF16_PER_LINE; e++)
+                values[e] = real_to_bf16(b_values[l*8 + e]);
+            write_lomem_line(B_ROW, l, pack_line(values));
+        end
+
+        emit_stream_strided(0, DOMAIN_LOMEM, LAYOUT_ROW_MAJOR, OUT_ROW,
+                            0, 2, 2, 1, 4);
+        emit_stream(1, DOMAIN_LOMEM, LAYOUT_ROW_MAJOR, A_ROW, 0, 4, 1, 1);
+        emit_stream(2, DOMAIN_LOMEM, LAYOUT_ROW_MAJOR, B_ROW, 0, 4, 1, 1);
+        emit(asm_acc_reset());
+        emit(asm_elementwise_add(1, 2, ELEMENTS));
+        emit(asm_write_accumulators(0, ELEMENTS));
+        emit(asm_halt());
+        run_program();
+        check(!error, "outer_stride: no error");
+
+        for (int unsigned n = 0; n < 4; n++) begin
+            // Lines 0 and 1 at q = 0 and 1, lines 2 and 3 at q = 4 and 5.
+            q    = (n < 2) ? n : (n + 2);
+            line = lomem_line(OUT_ROW, q);
+            for (int unsigned e = 0; e < BF16_PER_LINE; e++) begin
+                expected = a_values[n*8 + e] + b_values[n*8 + e];
+                check_close(bf16_to_real(line_value(line, e)), expected,
+                            $sformatf("outer_stride: line %0d value %0d", n, e));
+            end
+        end
+        check(lomem_line(OUT_ROW, 2) == '1,
+              "outer_stride: skipped lane 2 untouched");
+        check(lomem_line(OUT_ROW, 3) == '1,
+              "outer_stride: skipped lane 3 untouched");
+    endtask
+
     // A read that follows an unfinished write to the same rows must see the
     // written data, and the Command stage must report a dependency stall while
     // it waits (section 19).
@@ -838,7 +911,9 @@ module mcore_tb
 
         emit_stream(0, DOMAIN_LOMEM, LAYOUT_ROW_MAJOR, OUT_ROW, 0, 1, 2, 1);
         emit_stream(1, DOMAIN_LOMEM, LAYOUT_ROW_MAJOR, A_ROW, 0, 1, 1, 1);
-        emit_stream(2, DOMAIN_LOMEM, LAYOUT_ROW_MAJOR, B_ROW, 0, 1, 1, 1);
+        // Both passes take B from the same line, so the B stream has a zero
+        // stride and two outer iterations rather than advancing.
+        emit_stream(2, DOMAIN_LOMEM, LAYOUT_ROW_MAJOR, B_ROW, 0, 1, 2, 0);
         emit_stream(3, DOMAIN_LOMEM, LAYOUT_ROW_MAJOR, OUT_ROW, 0, 1, 1, 1);
         emit(asm_acc_reset());
         emit(asm_elementwise_add(1, 2, ELEMENTS));
@@ -935,6 +1010,8 @@ module mcore_tb
             test_reduce_and_write_buf();
         if (selected("scale"))
             test_scale_accumulators();
+        if (selected("stride"))
+            test_outer_stride();
         if (selected("dep"))
             test_range_dependency();
 

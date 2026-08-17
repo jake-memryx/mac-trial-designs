@@ -50,12 +50,17 @@ module mcore_cmd
     output logic                        structural_stall,
     output logic                        dependency_stall
 );
+    // A memory instruction takes the long path: CP_RUN captures its stream
+    // views, CP_RANGE walks the cursor one access per cycle to get the exact
+    // row range it will touch, and CP_ISSUE checks that range against the
+    // reservation table and dispatches. Everything else issues straight from
+    // CP_RUN (section 19).
     typedef enum logic [2:0] {
         CP_IDLE      = 3'd0,
         CP_RUN       = 3'd1,
         CP_STREAM_W1 = 3'd2,
-        CP_STREAM_W2 = 3'd3,
-        CP_STREAM_W3 = 3'd4,
+        CP_RANGE     = 3'd3,
+        CP_ISSUE     = 3'd4,
         CP_SKIP_LOOP = 3'd5,
         CP_DRAIN     = 3'd6
     } cmd_state_e;
@@ -69,8 +74,10 @@ module mcore_cmd
     logic signed [INT_WIDTH-1:0] int_rf [0:INT_REGISTERS-1];
     logic [INT_REGISTERS-1:0]    rf_valid;
     stream_desc_t                stream_desc [0:STREAM_SLOTS-1];
-    logic signed [INT_WIDTH-1:0] inner_cursor [0:STREAM_SLOTS-1];
-    logic signed [INT_WIDTH-1:0] outer_cursor [0:STREAM_SLOTS-1];
+    logic [STREAM_COUNT_WIDTH-1:0]       inner_cursor [0:STREAM_SLOTS-1];
+    logic [STREAM_COUNT_WIDTH-1:0]       outer_cursor [0:STREAM_SLOTS-1];
+    logic signed [STREAM_ADDR_WIDTH-1:0] cursor_addr [0:STREAM_SLOTS-1];
+    logic signed [STREAM_ADDR_WIDTH-1:0] cursor_base [0:STREAM_SLOTS-1];
     logic signed [INT_WIDTH-1:0] loop_remaining [0:LOOP_STACK_DEPTH-1];
     logic [PROG_ADDR_WIDTH-1:0]  loop_body_pc [0:LOOP_STACK_DEPTH-1];
     logic [$clog2(LOOP_STACK_DEPTH+1)-1:0] loop_sp;
@@ -78,15 +85,34 @@ module mcore_cmd
     logic [SEQ_WIDTH-1:0]        seq_counter;
     logic                        error_q;
 
-    // set_stream staging across its four words.
-    logic [STREAM_ID_WIDTH-1:0]  ss_id;
-    mem_domain_e                 ss_domain;
-    layout_e                     ss_layout;
-    logic [MEM_ROW_WIDTH-1:0]    ss_base_row;
-    logic                        ss_has_outer_stride;
-    logic [4:0]                  ss_reg_select;
-    logic signed [INT_WIDTH-1:0] ss_offset, ss_inner_count;
-    logic signed [INT_WIDTH-1:0] ss_outer_count, ss_inner_stride;
+    // set_stream staging across its two words: word 0 is captured here and
+    // word 1 supplies the counts and strides, so the descriptor commits in
+    // CP_STREAM_W1.
+    logic [STREAM_ID_WIDTH-1:0]          ss_id;
+    mem_domain_e                         ss_domain;
+    layout_e                             ss_layout;
+    logic [MEM_ROW_WIDTH-1:0]            ss_base_row;
+    logic                                ss_has_outer_stride;
+    logic [4:0]                          ss_reg_select;
+    logic signed [STREAM_ADDR_WIDTH-1:0] ss_offset;
+
+    // Range walker. One stream_step and one stream_row instance walk the cursor
+    // of the addressed stream, accumulating the row range as they go, so a
+    // multi-access command costs one cycle per access at issue and the design
+    // needs no multiplier and no parallel walk chain.
+    localparam int unsigned WALK_WIDTH = $clog2(MAX_STREAM_ACCESSES+1);
+
+    logic [WALK_WIDTH-1:0]                    walk_left;
+    logic                                     walk_phase_b;
+    logic                                     walk_wide;
+    logic                                     walk_first;
+    logic [MEM_ROW_WIDTH-1:0]                 walk_row;
+    stream_view_t                             walk_view;
+    logic [MEM_ROW_WIDTH-1:0]                 range_low  [0:1];
+    logic [MEM_ROW_WIDTH-1:0]                 range_high [0:1];
+    // The views a queued command carries: captured before the walk moves the
+    // cursors, which is what makes issue-time capture exact (section 15).
+    stream_view_t                             issue_view_a, issue_view_b;
 
     // Reservation table.
     logic [RESERVATIONS-1:0]         res_valid;
@@ -129,14 +155,35 @@ module mcore_cmd
     assign out_lines     = 4'((count + 7'd7) >> 3);
     assign scale_rows    = 2'((count + 7'd31) >> 5);
 
+    // Decoded fields are landed in nets before any of them is indexed. Selecting
+    // a bit range directly out of a function call is legal SystemVerilog but not
+    // universally supported by synthesis front ends.
+    logic signed [INT_WIDTH-1:0]           imm_field;
+    logic [REG_IDX_WIDTH-1:0]              imm_reg_index;
+    logic [4:0]                            ss_select;
+    logic signed [STREAM_ADDR_WIDTH-1:0]   ss_offset_field;
+    logic [STREAM_COUNT_WIDTH-1:0]         ss_inner_count_field;
+    logic [STREAM_COUNT_WIDTH-1:0]         ss_outer_count_field;
+    logic signed [STREAM_STRIDE_WIDTH-1:0] ss_inner_stride_field;
+    logic signed [STREAM_STRIDE_WIDTH-1:0] ss_outer_stride_field;
+
+    assign imm_field             = instr_imm(word);
+    assign imm_reg_index         = imm_field[REG_IDX_WIDTH-1:0];
+    assign ss_select             = setstream_reg_select(word);
+    assign ss_offset_field       = setstream_offset(word);
+    assign ss_inner_count_field  = setstream_inner_count(word);
+    assign ss_outer_count_field  = setstream_outer_count(word);
+    assign ss_inner_stride_field = setstream_inner_stride(word);
+    assign ss_outer_stride_field = setstream_outer_stride(word);
+
     // An IntValue is either a literal or a register read; reading a register
     // that was never written is an illegal program (section 20).
     always_comb begin
         if (instr_imm_is_reg(word)) begin
-            imm_value       = int_rf[instr_imm(word)[REG_IDX_WIDTH-1:0]];
-            imm_reg_missing = !rf_valid[instr_imm(word)[REG_IDX_WIDTH-1:0]];
+            imm_value       = int_rf[imm_reg_index];
+            imm_reg_missing = !rf_valid[imm_reg_index];
         end else begin
-            imm_value       = instr_imm(word);
+            imm_value       = imm_field;
             imm_reg_missing = 1'b0;
         end
     end
@@ -147,12 +194,16 @@ module mcore_cmd
                          stream_desc[sid_b[$clog2(STREAM_SLOTS)-1:0]].valid;
 
     always_comb begin
-        view_a.desc         = stream_desc[sid_a[$clog2(STREAM_SLOTS)-1:0]];
-        view_a.inner_cursor = inner_cursor[sid_a[$clog2(STREAM_SLOTS)-1:0]];
-        view_a.outer_cursor = outer_cursor[sid_a[$clog2(STREAM_SLOTS)-1:0]];
-        view_b.desc         = stream_desc[sid_b[$clog2(STREAM_SLOTS)-1:0]];
-        view_b.inner_cursor = inner_cursor[sid_b[$clog2(STREAM_SLOTS)-1:0]];
-        view_b.outer_cursor = outer_cursor[sid_b[$clog2(STREAM_SLOTS)-1:0]];
+        view_a.desc         = stream_desc[sid_a[SLOT_WIDTH-1:0]];
+        view_a.inner_cursor = inner_cursor[sid_a[SLOT_WIDTH-1:0]];
+        view_a.outer_cursor = outer_cursor[sid_a[SLOT_WIDTH-1:0]];
+        view_a.addr         = cursor_addr[sid_a[SLOT_WIDTH-1:0]];
+        view_a.outer_base   = cursor_base[sid_a[SLOT_WIDTH-1:0]];
+        view_b.desc         = stream_desc[sid_b[SLOT_WIDTH-1:0]];
+        view_b.inner_cursor = inner_cursor[sid_b[SLOT_WIDTH-1:0]];
+        view_b.outer_cursor = outer_cursor[sid_b[SLOT_WIDTH-1:0]];
+        view_b.addr         = cursor_addr[sid_b[SLOT_WIDTH-1:0]];
+        view_b.outer_base   = cursor_base[sid_b[SLOT_WIDTH-1:0]];
     end
 
     always_comb begin
@@ -173,12 +224,14 @@ module mcore_cmd
         need_wb      = 1'b0;
         decode_error = 1'b0;
 
+        // Payload views come from the captured copies, which is what the walk
+        // preserved; a command that needs no memory does not use them.
         fetch_cmd                   = '0;
         fetch_cmd.seq               = issue_seq;
         fetch_cmd.count             = count;
         fetch_cmd.accumulator_index = instr_acc_index(word);
-        fetch_cmd.view_a            = view_a;
-        fetch_cmd.view_b            = view_b;
+        fetch_cmd.view_a            = issue_view_a;
+        fetch_cmd.view_b            = issue_view_b;
 
         compute_cmd       = '0;
         compute_cmd.seq   = issue_seq;
@@ -188,8 +241,8 @@ module mcore_cmd
         wb_cmd.seq        = issue_seq;
         wb_cmd.count      = count;
         wb_cmd.buffer_idx = instr_buffer_idx(word);
-        wb_cmd.view_out   = view_a;
-        wb_cmd.view_scale = view_a;
+        wb_cmd.view_out   = issue_view_a;
+        wb_cmd.view_scale = issue_view_a;
 
         case (opcode)
             OP_LI, OP_ADDI, OP_LOOP, OP_ENDLOOP, OP_JUMP, OP_BLT, OP_BGE,
@@ -264,8 +317,8 @@ module mcore_cmd
                 need_wb           = 1'b1;
                 compute_cmd.op    = COMPUTE_SNAPSHOT;
                 wb_cmd.op         = WB_SCALE;
-                wb_cmd.view_scale = view_a;
-                wb_cmd.view_out   = view_b;
+                wb_cmd.view_scale = issue_view_a;
+                wb_cmd.view_out   = issue_view_b;
                 decode_error      = !stream_a_ok || !stream_b_ok ||
                                     (count == '0) || (count > 7'd64) ||
                                     (view_a.desc.domain != DOMAIN_LOMEM) ||
@@ -293,36 +346,33 @@ module mcore_cmd
     end
 
     // --------------------------------------------------- range reservations
-    // Ranges are conservative: whole rows, and for a stream consumed to
-    // exhaustion the whole remaining descriptor extent. Negative strides are
-    // handled by taking the smaller of the first and last row as the low bound.
-    function automatic logic [MEM_ROW_WIDTH-1:0] range_first(
-            stream_view_t v, logic wide);
-        return stream_row(v.desc, stream_index(v), wide);
-    endfunction
-
-    function automatic logic [MEM_ROW_WIDTH-1:0] range_last_n(
-            stream_view_t v, logic wide, int unsigned n);
-        return stream_row(v.desc, stream_index_ahead(v, n - 1), wide);
-    endfunction
-
-    function automatic logic [MEM_ROW_WIDTH-1:0] range_last_all(
-            stream_view_t v, logic wide);
-        stream_view_t last;
-        last              = v;
-        last.inner_cursor = v.desc.inner_count - 32'sd1;
-        last.outer_cursor = v.desc.outer_count - 32'sd1;
-        return stream_row(last.desc, stream_index(last), wide);
-    endfunction
-
+    // Two kinds of range, both computed without a multiplier:
+    //
+    //   bounded    up to MAX_STREAM_ACCESSES accesses, walked one per cycle in
+    //              CP_RANGE, giving the exact row range,
+    //   exhausting broadcast_mac and multi_mac consume a whole descriptor, so
+    //              the range is the whole domain.
+    //
+    // The whole-domain approximation is safe and nearly free: reads only
+    // conflict with writes, every write range is exact, and a write that
+    // follows an exhausting read has to wait for Compute to drain that read's
+    // packets anyway.
     logic                     res_need_a, res_need_b;
     logic                     res_a_write, res_b_write;
     logic                     res_a_owner_wb, res_b_owner_wb;
+    logic                     exhausting;
+    logic [3:0]               accesses_a, accesses_b;
+    logic                     wide_a, wide_b;
     mem_domain_e              res_a_domain, res_b_domain;
-    logic [MEM_ROW_WIDTH-1:0] res_a_first, res_a_last;
-    logic [MEM_ROW_WIDTH-1:0] res_b_first, res_b_last;
     logic [MEM_ROW_WIDTH-1:0] res_a_low, res_a_high;
     logic [MEM_ROW_WIDTH-1:0] res_b_low, res_b_high;
+
+    assign res_a_domain = issue_view_a.desc.domain;
+    assign res_b_domain = issue_view_b.desc.domain;
+    assign res_a_low    = range_low[0];
+    assign res_a_high   = range_high[0];
+    assign res_b_low    = range_low[1];
+    assign res_b_high   = range_high[1];
 
     always_comb begin
         res_need_a     = 1'b0;
@@ -331,36 +381,34 @@ module mcore_cmd
         res_b_write    = 1'b0;
         res_a_owner_wb = 1'b0;
         res_b_owner_wb = 1'b0;
-        res_a_domain   = view_a.desc.domain;
-        res_b_domain   = view_b.desc.domain;
-        res_a_first    = range_first(view_a, 1'b0);
-        res_a_last     = res_a_first;
-        res_b_first    = range_first(view_b, 1'b0);
-        res_b_last     = res_b_first;
+        exhausting     = 1'b0;
+        accesses_a     = 4'd0;
+        accesses_b     = 4'd0;
+        wide_a         = 1'b0;
+        wide_b         = 1'b0;
 
         case (opcode)
             OP_LOAD_ACCUMULATORS: begin
                 res_need_a = 1'b1;
+                accesses_a = 4'd1;
             end
             OP_BROADCAST_MAC: begin
                 res_need_a = 1'b1;
                 res_need_b = 1'b1;
-                res_a_last = range_last_all(view_a, 1'b0);
-                res_b_last = range_last_all(view_b, 1'b0);
+                exhausting = 1'b1;
             end
             OP_MULTI_MAC: begin
-                res_need_a  = 1'b1;
-                res_need_b  = 1'b1;
-                res_a_first = range_first(view_a, 1'b1);
-                res_b_first = range_first(view_b, 1'b1);
-                res_a_last  = range_last_n(view_a, 1'b1, 32'(scale_rows));
-                res_b_last  = range_last_n(view_b, 1'b1, 32'(scale_rows));
+                res_need_a = 1'b1;
+                res_need_b = 1'b1;
+                exhausting = 1'b1;
+                wide_a     = 1'b1;
+                wide_b     = 1'b1;
             end
             OP_ELEMENTWISE_ADD, OP_ELEMENTWISE_MUL: begin
                 res_need_a = 1'b1;
                 res_need_b = 1'b1;
-                res_a_last = range_last_n(view_a, 1'b0, 32'(out_lines));
-                res_b_last = range_last_n(view_b, 1'b0, 32'(out_lines));
+                accesses_a = out_lines;
+                accesses_b = out_lines;
             end
             OP_SCALE_ACCUMULATORS: begin
                 res_need_a     = 1'b1;
@@ -368,32 +416,47 @@ module mcore_cmd
                 res_a_owner_wb = 1'b1;
                 res_b_owner_wb = 1'b1;
                 res_b_write    = 1'b1;
-                res_a_first    = range_first(view_a, 1'b1);
-                res_a_last     = range_last_n(view_a, 1'b1, 32'(scale_rows));
-                res_b_last     = range_last_n(view_b, 1'b0, 32'(out_lines));
+                accesses_a     = {2'b0, scale_rows};
+                accesses_b     = out_lines;
+                wide_a         = 1'b1;
             end
             OP_WRITE_ACCUMULATORS: begin
                 res_need_a     = 1'b1;
                 res_a_write    = 1'b1;
                 res_a_owner_wb = 1'b1;
-                res_a_last     = range_last_n(view_a, 1'b0, 32'(out_lines));
+                accesses_a     = out_lines;
             end
             OP_WRITE_BUF: begin
                 res_need_a     = 1'b1;
                 res_a_write    = 1'b1;
                 res_a_owner_wb = 1'b1;
+                accesses_a     = 4'd1;
             end
             OP_SET_STREAM, OP_LI, OP_ADDI, OP_LOOP, OP_ENDLOOP, OP_JUMP,
             OP_BLT, OP_BGE, OP_ACC_RESET, OP_REDUCE_ACCUMULATORS,
             OP_HALT: res_need_a = 1'b0;
             default: res_need_a = 1'b0;
         endcase
-
-        res_a_low  = (res_a_first <= res_a_last) ? res_a_first : res_a_last;
-        res_a_high = (res_a_first <= res_a_last) ? res_a_last : res_a_first;
-        res_b_low  = (res_b_first <= res_b_last) ? res_b_first : res_b_last;
-        res_b_high = (res_b_first <= res_b_last) ? res_b_last : res_b_first;
     end
+
+    // Any instruction that reserves a range goes the long way round.
+    logic needs_range;
+    assign needs_range = res_need_a || res_need_b;
+
+    // The row the walker is looking at. One stream_row instance for the whole
+    // Command stage.
+    assign walk_row = stream_row(walk_view.desc, stream_addr(walk_view),
+                                 walk_wide);
+
+    // The stepped and exhausted views, landed in nets so there is exactly one
+    // step instance and one exhaust instance each, and so no member is selected
+    // straight out of a function call.
+    stream_view_t walk_next;
+    stream_view_t exhaust_a, exhaust_b;
+
+    assign walk_next = stream_step(walk_view);
+    assign exhaust_a = stream_exhaust(view_a);
+    assign exhaust_b = stream_exhaust(view_b);
 
     // A new read conflicts with an older write and a new write with an older
     // read; write-write pairs are ordered by the WB command FIFO.
@@ -446,14 +509,19 @@ module mcore_cmd
     end
 
     // ---------------------------------------------------------------- issue
+    // An instruction dispatches either directly from CP_RUN, when it reserves
+    // nothing, or from CP_ISSUE once its range is known.
     logic can_issue;
+    logic issue_phase;
 
-    assign all_ready = (!need_fetch   || fetch_cmd_ready) &&
-                       (!need_compute || compute_cmd_ready) &&
-                       (!need_wb      || wb_cmd_ready);
-    assign can_issue = (state == CP_RUN) && !decode_error && !res_conflict &&
-                       res_space_ok;
-    assign issue_ok  = can_issue && all_ready;
+    assign issue_phase = ((state == CP_RUN) && !needs_range) ||
+                         (state == CP_ISSUE);
+    assign all_ready   = (!need_fetch   || fetch_cmd_ready) &&
+                         (!need_compute || compute_cmd_ready) &&
+                         (!need_wb      || wb_cmd_ready);
+    assign can_issue   = issue_phase && !decode_error && !res_conflict &&
+                         res_space_ok;
+    assign issue_ok    = can_issue && all_ready;
 
     // Atomic dispatch: a stage sees valid only when every other stage this
     // instruction needs can accept in the same cycle.
@@ -461,9 +529,9 @@ module mcore_cmd
     assign compute_cmd_valid = need_compute && can_issue && all_ready;
     assign wb_cmd_valid      = need_wb      && can_issue && all_ready;
 
-    assign structural_stall = (state == CP_RUN) && !decode_error &&
+    assign structural_stall = issue_phase && !decode_error &&
                               !res_conflict && res_space_ok && !all_ready;
-    assign dependency_stall = (state == CP_RUN) && !decode_error &&
+    assign dependency_stall = issue_phase && !decode_error &&
                               (res_conflict || !res_space_ok);
 
     assign prog_addr = pc;
@@ -481,6 +549,8 @@ module mcore_cmd
             CP_RUN: begin
                 if (decode_error)
                     next_state = CP_DRAIN;
+                else if (needs_range)
+                    next_state = CP_RANGE;
                 else if (issue_ok) begin
                     if (opcode == OP_SET_STREAM)
                         next_state = CP_STREAM_W1;
@@ -490,9 +560,20 @@ module mcore_cmd
                         next_state = CP_DRAIN;
                 end
             end
-            CP_STREAM_W1: next_state = CP_STREAM_W2;
-            CP_STREAM_W2: next_state = CP_STREAM_W3;
-            CP_STREAM_W3: next_state = CP_RUN;
+            CP_STREAM_W1: next_state = CP_RUN;
+            // One access per cycle for the walked stream, then the other one,
+            // then issue. An exhausting command needs no walk at all.
+            CP_RANGE: begin
+                if (exhausting)
+                    next_state = CP_ISSUE;
+                else if ((walk_left == WALK_WIDTH'(1'b1)) &&
+                         (walk_phase_b || (accesses_b == 4'd0)))
+                    next_state = CP_ISSUE;
+            end
+            CP_ISSUE: begin
+                if (issue_ok)
+                    next_state = CP_RUN;
+            end
             CP_SKIP_LOOP: begin
                 if ((opcode == OP_ENDLOOP) && (skip_depth == SP_WIDTH'(1'b1)))
                     next_state = CP_RUN;
@@ -509,37 +590,58 @@ module mcore_cmd
     logic [SLOT_WIDTH-1:0] slot_a, slot_b;
     logic [1:0]            loop_top;
     logic                  ss_field_missing;
-    logic signed [INT_WIDTH-1:0] ss_word_high, ss_word_low;
 
     assign slot_a   = sid_a[SLOT_WIDTH-1:0];
     assign slot_b   = sid_b[SLOT_WIDTH-1:0];
     assign loop_top = 2'(loop_sp - SP_WIDTH'(1'b1));
 
-    // A set_stream field selected by reg_select carries a register index in the
-    // low bits of its word instead of a literal.
-    function automatic logic signed [INT_WIDTH-1:0] ss_resolve(
-            logic selected, logic signed [INT_WIDTH-1:0] slot_value);
-        return selected ? int_rf[slot_value[REG_IDX_WIDTH-1:0]] : slot_value;
+    // A set_stream field selected by reg_select carries a register index in its
+    // low four bits instead of a literal. A register is 32-bit, so a resolved
+    // field is truncated to the field width (section 21).
+    function automatic logic [STREAM_COUNT_WIDTH-1:0] ss_count(
+            logic selected, logic [STREAM_COUNT_WIDTH-1:0] field);
+        logic signed [INT_WIDTH-1:0] register_value;
+        register_value = int_rf[field[REG_IDX_WIDTH-1:0]];
+        return selected ? register_value[STREAM_COUNT_WIDTH-1:0] : field;
     endfunction
 
-    function automatic logic ss_missing(
-            logic selected, logic signed [INT_WIDTH-1:0] slot_value);
-        return selected && !rf_valid[slot_value[REG_IDX_WIDTH-1:0]];
+    function automatic logic signed [STREAM_STRIDE_WIDTH-1:0] ss_stride(
+            logic selected, logic signed [STREAM_STRIDE_WIDTH-1:0] field);
+        logic signed [INT_WIDTH-1:0] register_value;
+        register_value = int_rf[field[REG_IDX_WIDTH-1:0]];
+        return selected ? $signed(register_value[STREAM_STRIDE_WIDTH-1:0])
+                        : field;
     endfunction
 
-    assign ss_word_high = instr_high_word(word);
-    assign ss_word_low  = instr_low_word(word);
+    function automatic logic signed [STREAM_ADDR_WIDTH-1:0] ss_addr(
+            logic selected, logic signed [STREAM_ADDR_WIDTH-1:0] field);
+        logic signed [INT_WIDTH-1:0] register_value;
+        register_value = int_rf[field[REG_IDX_WIDTH-1:0]];
+        return selected ? $signed(register_value[STREAM_ADDR_WIDTH-1:0]) : field;
+    endfunction
 
+    function automatic logic ss_missing(logic selected,
+                                        logic [REG_IDX_WIDTH-1:0] index);
+        return selected && !rf_valid[index];
+    endfunction
+
+    // Word 0 carries the offset, word 1 the counts and strides.
     always_comb begin
         ss_field_missing = 1'b0;
-        if (state == CP_STREAM_W1)
-            ss_field_missing = ss_missing(ss_reg_select[4], ss_word_high) ||
-                               ss_missing(ss_reg_select[3], ss_word_low);
-        else if (state == CP_STREAM_W2)
-            ss_field_missing = ss_missing(ss_reg_select[2], ss_word_high) ||
-                               ss_missing(ss_reg_select[1], ss_word_low);
-        else if (state == CP_STREAM_W3)
-            ss_field_missing = ss_missing(ss_reg_select[0], ss_word_high);
+        if (state == CP_RUN)
+            ss_field_missing =
+                ss_missing(ss_select[4],
+                           ss_offset_field[REG_IDX_WIDTH-1:0]);
+        else if (state == CP_STREAM_W1)
+            ss_field_missing =
+                ss_missing(ss_reg_select[3],
+                           ss_inner_count_field[REG_IDX_WIDTH-1:0]) ||
+                ss_missing(ss_reg_select[2],
+                           ss_outer_count_field[REG_IDX_WIDTH-1:0]) ||
+                ss_missing(ss_reg_select[1],
+                           ss_inner_stride_field[REG_IDX_WIDTH-1:0]) ||
+                ss_missing(ss_reg_select[0],
+                           ss_outer_stride_field[REG_IDX_WIDTH-1:0]);
     end
 
     always_ff @(posedge clk) begin
@@ -558,6 +660,8 @@ module mcore_cmd
                 stream_desc[s]  <= '0;
                 inner_cursor[s] <= '0;
                 outer_cursor[s] <= '0;
+                cursor_addr[s]  <= '0;
+                cursor_base[s]  <= '0;
             end
         end else begin
             state <= next_state;
@@ -588,6 +692,8 @@ module mcore_cmd
                             stream_desc[s].valid <= 1'b0;
                             inner_cursor[s]      <= '0;
                             outer_cursor[s]      <= '0;
+                            cursor_addr[s]       <= '0;
+                            cursor_base[s]       <= '0;
                         end
                     end
                 end
@@ -595,31 +701,23 @@ module mcore_cmd
                 CP_RUN: begin
                     if (decode_error) begin
                         error_q <= 1'b1;
+                    end else if (needs_range) begin
+                        // Capture the views the command will carry, then walk.
+                        // An exhausting command has nothing to walk and takes
+                        // the whole domain as its range.
+                        issue_view_a <= view_a;
+                        issue_view_b <= view_b;
+                        walk_phase_b <= 1'b0;
+                        walk_first   <= 1'b1;
+                        walk_view    <= view_a;
+                        walk_left    <= accesses_a;
+                        walk_wide    <= wide_a;
                     end else if (issue_ok) begin
                         pc <= sequential_pc;
 
                         if (need_fetch || need_compute || need_wb)
                             seq_counter <= (issue_seq == {SEQ_WIDTH{1'b1}}) ?
                                            SEQ_WIDTH'(1) : issue_seq + 1'b1;
-
-                        if (res_need_a) begin
-                            res_valid[res_slot_a]    <= 1'b1;
-                            res_seq[res_slot_a]      <= issue_seq;
-                            res_domain[res_slot_a]   <= res_a_domain;
-                            res_write[res_slot_a]    <= res_a_write;
-                            res_owner_wb[res_slot_a] <= res_a_owner_wb;
-                            res_low[res_slot_a]      <= res_a_low;
-                            res_high[res_slot_a]     <= res_a_high;
-                        end
-                        if (res_need_b) begin
-                            res_valid[res_slot_b]    <= 1'b1;
-                            res_seq[res_slot_b]      <= issue_seq;
-                            res_domain[res_slot_b]   <= res_b_domain;
-                            res_write[res_slot_b]    <= res_b_write;
-                            res_owner_wb[res_slot_b] <= res_b_owner_wb;
-                            res_low[res_slot_b]      <= res_b_low;
-                            res_high[res_slot_b]     <= res_b_high;
-                        end
 
                         case (opcode)
                             OP_LI: begin
@@ -655,6 +753,8 @@ module mcore_cmd
                                     pc <= branch_pc;
                             end
                             OP_SET_STREAM: begin
+                                ss_offset           <=
+                                    ss_addr(ss_select[4], ss_offset_field);
                                 ss_id               <= setstream_id(word);
                                 ss_domain           <= setstream_domain(word);
                                 ss_layout           <= setstream_layout(word);
@@ -662,98 +762,149 @@ module mcore_cmd
                                 ss_has_outer_stride <=
                                     setstream_has_outer_stride(word);
                                 ss_reg_select       <= setstream_reg_select(word);
-                                if (setstream_id(word) >=
-                                    STREAM_ID_WIDTH'(STREAM_SLOTS))
+                                if ((setstream_id(word) >=
+                                     STREAM_ID_WIDTH'(STREAM_SLOTS)) ||
+                                    ss_field_missing)
                                     error_q <= 1'b1;
                             end
-                            OP_LOAD_ACCUMULATORS: begin
-                                inner_cursor[slot_a] <=
-                                    stream_advance(view_a, 1).inner_cursor;
-                                outer_cursor[slot_a] <=
-                                    stream_advance(view_a, 1).outer_cursor;
-                            end
-                            OP_BROADCAST_MAC, OP_MULTI_MAC: begin
-                                inner_cursor[slot_a] <=
-                                    stream_exhaust(view_a).inner_cursor;
-                                outer_cursor[slot_a] <=
-                                    stream_exhaust(view_a).outer_cursor;
-                                inner_cursor[slot_b] <=
-                                    stream_exhaust(view_b).inner_cursor;
-                                outer_cursor[slot_b] <=
-                                    stream_exhaust(view_b).outer_cursor;
-                            end
-                            OP_ELEMENTWISE_ADD, OP_ELEMENTWISE_MUL: begin
-                                inner_cursor[slot_a] <=
-                                    stream_advance(view_a, 32'(out_lines)).inner_cursor;
-                                outer_cursor[slot_a] <=
-                                    stream_advance(view_a, 32'(out_lines)).outer_cursor;
-                                inner_cursor[slot_b] <=
-                                    stream_advance(view_b, 32'(out_lines)).inner_cursor;
-                                outer_cursor[slot_b] <=
-                                    stream_advance(view_b, 32'(out_lines)).outer_cursor;
-                            end
-                            OP_SCALE_ACCUMULATORS: begin
-                                inner_cursor[slot_a] <=
-                                    stream_advance(view_a, 32'(scale_rows)).inner_cursor;
-                                outer_cursor[slot_a] <=
-                                    stream_advance(view_a, 32'(scale_rows)).outer_cursor;
-                                inner_cursor[slot_b] <=
-                                    stream_advance(view_b, 32'(out_lines)).inner_cursor;
-                                outer_cursor[slot_b] <=
-                                    stream_advance(view_b, 32'(out_lines)).outer_cursor;
-                            end
-                            OP_WRITE_ACCUMULATORS: begin
-                                inner_cursor[slot_a] <=
-                                    stream_advance(view_a, 32'(out_lines)).inner_cursor;
-                                outer_cursor[slot_a] <=
-                                    stream_advance(view_a, 32'(out_lines)).outer_cursor;
-                            end
-                            OP_WRITE_BUF: begin
-                                inner_cursor[slot_a] <=
-                                    stream_advance(view_a, 1).inner_cursor;
-                                outer_cursor[slot_a] <=
-                                    stream_advance(view_a, 1).outer_cursor;
-                            end
                             OP_HALT: pc <= pc;
-                            OP_ACC_RESET, OP_REDUCE_ACCUMULATORS: ;
+                            // Memory instructions never reach here: they issue
+                            // from CP_ISSUE, and their cursors were advanced by
+                            // the walk.
+                            OP_ACC_RESET, OP_REDUCE_ACCUMULATORS,
+                            OP_LOAD_ACCUMULATORS, OP_BROADCAST_MAC,
+                            OP_MULTI_MAC, OP_ELEMENTWISE_ADD,
+                            OP_ELEMENTWISE_MUL, OP_SCALE_ACCUMULATORS,
+                            OP_WRITE_ACCUMULATORS, OP_WRITE_BUF: ;
                             default: ;
                         endcase
                     end
                 end
 
+                // Word 1 completes the descriptor. `contiguous` stands in for the
+                // specified inner_count * inner_stride default, so nothing here
+                // multiplies (section 15).
                 CP_STREAM_W1: begin
-                    pc             <= sequential_pc;
-                    ss_offset      <= ss_resolve(ss_reg_select[4], ss_word_high);
-                    ss_inner_count <= ss_resolve(ss_reg_select[3], ss_word_low);
-                    if (ss_field_missing)
-                        error_q <= 1'b1;
-                end
-                CP_STREAM_W2: begin
-                    pc              <= sequential_pc;
-                    ss_outer_count  <= ss_resolve(ss_reg_select[2], ss_word_high);
-                    ss_inner_stride <= ss_resolve(ss_reg_select[1], ss_word_low);
-                    if (ss_field_missing)
-                        error_q <= 1'b1;
-                end
-                CP_STREAM_W3: begin
                     pc <= sequential_pc;
-                    stream_desc[ss_id[SLOT_WIDTH-1:0]].valid        <= 1'b1;
-                    stream_desc[ss_id[SLOT_WIDTH-1:0]].domain       <= ss_domain;
-                    stream_desc[ss_id[SLOT_WIDTH-1:0]].layout       <= ss_layout;
-                    stream_desc[ss_id[SLOT_WIDTH-1:0]].base_row     <= ss_base_row;
-                    stream_desc[ss_id[SLOT_WIDTH-1:0]].offset       <= ss_offset;
-                    stream_desc[ss_id[SLOT_WIDTH-1:0]].inner_count  <= ss_inner_count;
-                    stream_desc[ss_id[SLOT_WIDTH-1:0]].outer_count  <= ss_outer_count;
-                    stream_desc[ss_id[SLOT_WIDTH-1:0]].inner_stride <= ss_inner_stride;
+                    stream_desc[ss_id[SLOT_WIDTH-1:0]].valid     <= 1'b1;
+                    stream_desc[ss_id[SLOT_WIDTH-1:0]].domain    <= ss_domain;
+                    stream_desc[ss_id[SLOT_WIDTH-1:0]].layout    <= ss_layout;
+                    stream_desc[ss_id[SLOT_WIDTH-1:0]].base_row  <= ss_base_row;
+                    stream_desc[ss_id[SLOT_WIDTH-1:0]].inner_count <=
+                        ss_count(ss_reg_select[3], setstream_inner_count(word));
+                    stream_desc[ss_id[SLOT_WIDTH-1:0]].outer_count <=
+                        ss_count(ss_reg_select[2], setstream_outer_count(word));
+                    stream_desc[ss_id[SLOT_WIDTH-1:0]].inner_stride <=
+                        ss_stride(ss_reg_select[1], setstream_inner_stride(word));
                     stream_desc[ss_id[SLOT_WIDTH-1:0]].outer_stride <=
-                        ss_has_outer_stride ?
-                        ss_resolve(ss_reg_select[0], ss_word_high) :
-                        (ss_inner_count * ss_inner_stride);
+                        ss_stride(ss_reg_select[0], setstream_outer_stride(word));
+                    stream_desc[ss_id[SLOT_WIDTH-1:0]].contiguous <=
+                        !ss_has_outer_stride;
                     inner_cursor[ss_id[SLOT_WIDTH-1:0]] <= '0;
                     outer_cursor[ss_id[SLOT_WIDTH-1:0]] <= '0;
-                    if (ss_field_missing || (ss_inner_count <= 0) ||
-                        (ss_outer_count <= 0))
+                    cursor_addr[ss_id[SLOT_WIDTH-1:0]]  <= ss_offset;
+                    cursor_base[ss_id[SLOT_WIDTH-1:0]]  <= ss_offset;
+                    if (ss_field_missing ||
+                        (ss_count(ss_reg_select[3],
+                                  setstream_inner_count(word)) == '0) ||
+                        (ss_count(ss_reg_select[2],
+                                  setstream_outer_count(word)) == '0))
                         error_q <= 1'b1;
+                end
+
+                // One access per cycle: take its row into the range, step the
+                // cursor, and on the last access write the cursor back and
+                // either start the second stream or go to issue.
+                CP_RANGE: begin
+                    if (exhausting) begin
+                        range_low[0]  <= '0;
+                        range_high[0] <= '1;
+                        range_low[1]  <= '0;
+                        range_high[1] <= '1;
+                    end else begin
+                        walk_view  <= stream_step(walk_view);
+                        walk_first <= 1'b0;
+                        walk_left  <= walk_left - WALK_WIDTH'(1'b1);
+
+                        if (walk_first) begin
+                            range_low[walk_phase_b]  <= walk_row;
+                            range_high[walk_phase_b] <= walk_row;
+                        end else begin
+                            if (walk_row < range_low[walk_phase_b])
+                                range_low[walk_phase_b] <= walk_row;
+                            if (walk_row > range_high[walk_phase_b])
+                                range_high[walk_phase_b] <= walk_row;
+                        end
+
+                        if (walk_left == WALK_WIDTH'(1'b1)) begin
+                            if (!walk_phase_b) begin
+                                inner_cursor[slot_a] <=
+                                    walk_next.inner_cursor;
+                                outer_cursor[slot_a] <=
+                                    walk_next.outer_cursor;
+                                cursor_addr[slot_a] <=
+                                    walk_next.addr;
+                                cursor_base[slot_a] <=
+                                    walk_next.outer_base;
+                                if (accesses_b != 4'd0) begin
+                                    walk_phase_b <= 1'b1;
+                                    walk_first   <= 1'b1;
+                                    walk_view    <= view_b;
+                                    walk_left    <= accesses_b;
+                                    walk_wide    <= wide_b;
+                                end
+                            end else begin
+                                inner_cursor[slot_b] <=
+                                    walk_next.inner_cursor;
+                                outer_cursor[slot_b] <=
+                                    walk_next.outer_cursor;
+                                cursor_addr[slot_b] <=
+                                    walk_next.addr;
+                                cursor_base[slot_b] <=
+                                    walk_next.outer_base;
+                            end
+                        end
+                    end
+                end
+
+                CP_ISSUE: begin
+                    if (issue_ok) begin
+                        pc          <= sequential_pc;
+                        seq_counter <= (issue_seq == {SEQ_WIDTH{1'b1}}) ?
+                                       SEQ_WIDTH'(1) : issue_seq + 1'b1;
+
+                        if (res_need_a) begin
+                            res_valid[res_slot_a]    <= 1'b1;
+                            res_seq[res_slot_a]      <= issue_seq;
+                            res_domain[res_slot_a]   <= res_a_domain;
+                            res_write[res_slot_a]    <= res_a_write;
+                            res_owner_wb[res_slot_a] <= res_a_owner_wb;
+                            res_low[res_slot_a]      <= res_a_low;
+                            res_high[res_slot_a]     <= res_a_high;
+                        end
+                        if (res_need_b) begin
+                            res_valid[res_slot_b]    <= 1'b1;
+                            res_seq[res_slot_b]      <= issue_seq;
+                            res_domain[res_slot_b]   <= res_b_domain;
+                            res_write[res_slot_b]    <= res_b_write;
+                            res_owner_wb[res_slot_b] <= res_b_owner_wb;
+                            res_low[res_slot_b]      <= res_b_low;
+                            res_high[res_slot_b]     <= res_b_high;
+                        end
+
+                        // Only the exhausting commands still owe a cursor
+                        // update; the walk committed everything else.
+                        if (exhausting) begin
+                            inner_cursor[slot_a] <=
+                                exhaust_a.inner_cursor;
+                            outer_cursor[slot_a] <=
+                                exhaust_a.outer_cursor;
+                            inner_cursor[slot_b] <=
+                                exhaust_b.inner_cursor;
+                            outer_cursor[slot_b] <=
+                                exhaust_b.outer_cursor;
+                        end
+                    end
                 end
 
                 CP_SKIP_LOOP: begin
@@ -761,7 +912,7 @@ module mcore_cmd
                     // decoding it, so its set_stream payload words are skipped
                     // as data.
                     if (opcode == OP_SET_STREAM)
-                        pc <= pc + PROG_ADDR_WIDTH'(SETSTREAM_WORDS);
+                        pc <= pc + PROG_ADDR_WIDTH'(SETSTREAM_WORDS[1:0]);
                     else
                         pc <= sequential_pc;
                     if (opcode == OP_LOOP)

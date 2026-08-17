@@ -11,7 +11,7 @@ GENUS ?= genus
 	test-bf16-arith cln4p-libs synth synth-bf16-mac \
 	synth-bf16-mama synth-bf16-multi-mac-tree power-bf16-multi-mac-tree \
 	breakdown-bf16-multi-mac-tree vcd-bf16-mama-gemv \
-	synth-bf16-add synth-bf16-mul synth-reg-512 synth-reg-512-noen \
+	synth-mcore synth-bf16-add synth-bf16-mul synth-reg-512 synth-reg-512-noen \
 	vcd-bf16-multi-mac-tree-gemv licenses clean
 
 all: test
@@ -292,6 +292,21 @@ breakdown-bf16-multi-mac-tree: cln4p-libs
 		TREE_VCD=../../$(TREE_VCD) \
 		$(GENUS) -batch \
 		-files ../../scripts/report_breakdown_tree.tcl -log genus.log
+
+# Matrix Core trial synthesis. Area characterization with hierarchy held, so the
+# Command/Fetch/Compute/Writeback split is attributable. The clock is relaxed by
+# default because the accumulate loop is flat in this build; power is vectorless
+# and carries no weight until there is an activity dump.
+MCORE_PERIOD  ?= 2.0
+MCORE_UNGROUP ?= 0
+MCORE_SYNTH_DIR = build/synth_mcore_p$(subst .,p,$(MCORE_PERIOD))_u$(MCORE_UNGROUP)
+
+synth-mcore: cln4p-libs
+	@mkdir -p $(MCORE_SYNTH_DIR)
+	cd $(MCORE_SYNTH_DIR) && \
+		MCORE_PERIOD=$(MCORE_PERIOD) \
+		MCORE_UNGROUP=$(MCORE_UNGROUP) \
+		$(GENUS) -batch -files ../../scripts/synth_mcore.tcl -log genus.log
 
 licenses:
 	@./scripts/check_licenses.sh

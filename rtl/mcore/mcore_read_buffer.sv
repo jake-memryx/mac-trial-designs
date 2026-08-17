@@ -126,10 +126,8 @@ module mcore_read_buffer
             entry_data[fill_index] <= rsp_data;
     end
 
-    initial begin
-        if (DEPTH < 2 || (DEPTH & (DEPTH - 1)) != 0)
-            $fatal(1, "mcore_read_buffer: DEPTH must be a power of two >= 2");
-        if (INDEX_WIDTH > TAG_WIDTH - 1)
-            $fatal(1, "mcore_read_buffer: DEPTH does not fit in a ticket tag");
-    end
+    if (DEPTH < 2 || (DEPTH & (DEPTH - 1)) != 0)
+        $error("mcore_read_buffer: DEPTH must be a power of two >= 2");
+    if (INDEX_WIDTH > TAG_WIDTH - 1)
+        $error("mcore_read_buffer: DEPTH does not fit in a ticket tag");
 endmodule

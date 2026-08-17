@@ -52,8 +52,8 @@ module mcore_fifo #(
             storage[write_pointer[PTR_WIDTH-1:0]] <= in_data;
     end
 
-    initial begin
-        if (DEPTH < 2 || (DEPTH & (DEPTH - 1)) != 0)
-            $fatal(1, "mcore_fifo: DEPTH must be a power of two >= 2");
-    end
+    // Elaboration-time check rather than an initial block, so it holds when the
+    // design is built as well as when it is simulated.
+    if (DEPTH < 2 || (DEPTH & (DEPTH - 1)) != 0)
+        $error("mcore_fifo: DEPTH must be a power of two >= 2");
 endmodule

@@ -292,7 +292,7 @@ remainder are choices this implementation makes.
 | `INT_REGISTERS` | 16 | §1 |
 | `OUTPUT_BUFFER_SLOTS` | 8 | §1 |
 | `SCALE_BUFFER_ENTRIES` | 32 | §7.10 |
-| `COMMAND_Q_DEPTH` | 4 | §1 |
+| `COMMAND_Q_DEPTH` | 2 | §1 (see §21) |
 | `DATA_Q_DEPTH` | 2 | §1 (see §21) |
 | `MEMORY_Q_DEPTH` | 12 | §1 |
 | `FETCH_BUFFER_DEPTH` | 4 | §1 |
@@ -306,6 +306,9 @@ remainder are choices this implementation makes.
 | `TICKET_WIDTH` | 5 | choice; `> $clog2(MEMORY_Q_DEPTH)` plus source bit |
 | `RESERVATIONS` | 4 | choice; range table depth |
 | `COUNT_WIDTH` | 7 | holds 1..64 |
+| `STREAM_ADDR_WIDTH` | 22 | stream index and cursor width, signed |
+| `STREAM_COUNT_WIDTH` | 16 | `inner_count`, `outer_count`, unsigned |
+| `STREAM_STRIDE_WIDTH` | 16 | `inner_stride`, `outer_stride`, signed |
 
 Derived: `ACC_SELECT_WIDTH = 4`, `LANE_SELECT_WIDTH = 2`,
 `STREAM_ID_WIDTH = 3` (field is 3 bits; slots above `STREAM_SLOTS` are illegal).
@@ -336,20 +339,23 @@ PC-relative displacement, because they use neither `count` nor `acc_index`.
 [44:33] offset        signed, relative to the sequential PC
 ```
 
-`set_stream` uses four words:
+`set_stream` uses two words. The narrowed stream fields of section 15 fit in
+119 bits, so the four-word form the 32-bit fields needed is unnecessary:
 
 ```text
 word0 [63:59] opcode          [58:56] stream id      [55] domain
       [54:53] layout          [52:37] base_row       [36] has_outer_stride
       [35:31] reg_select      MSB..LSB = offset, inner_count, outer_count,
                               inner_stride, outer_stride
-word1 [63:32] offset          [31:0]  inner_count
-word2 [63:32] outer_count     [31:0]  inner_stride
-word3 [63:32] outer_stride    [31:0]  reserved
+      [30:9]  offset          [8:0]   reserved
+word1 [63:48] inner_count     [47:32] outer_count
+      [31:16] inner_stride    [15:0]  outer_stride
 ```
 
 A field selected by `reg_select` carries a register index in the low 4 bits of
-its 32-bit slot and is resolved when the instruction executes.
+its own slot and is resolved when the instruction executes. A register is 32-bit
+and the fields are narrower, so a resolved field is truncated to its field
+width.
 
 Opcodes:
 
@@ -421,14 +427,43 @@ command even though it reads memory.
 
 ## 15. Address generation
 
-A stream cursor produces a logical index `q`:
+The architectural address of an access is
 
 ```text
-q = offset + outer_cursor * outer_stride + inner_cursor * inner_stride
+q = offset + outer * outer_stride + inner * inner_stride
 ```
 
-`q` is then mapped to a physical row, and for 128-bit accesses in LoMem to one
-of its four lanes. The unit of `q` is layout-specific:
+but no hardware evaluates that expression, because streams are always walked in
+order. `q` is state, advanced by one add per access:
+
+```text
+addr        logical index of the next access
+outer_base  logical index the current outer iteration started from
+
+step:
+  if (inner_cursor + 1 >= inner_count)          // outer wrap
+      inner_cursor = 0
+      outer_cursor = outer_cursor + 1
+      addr = outer_base = contiguous ? (addr + inner_stride)
+                                     : (outer_base + outer_stride)
+  else
+      inner_cursor = inner_cursor + 1
+      addr         = addr + inner_stride
+```
+
+`contiguous` is set when `set_stream` omits `outer_stride`, and it replaces the
+specified default `outer_stride = inner_count * inner_stride`: with that default
+the next outer iteration begins exactly one `inner_stride` past the last inner
+address, which is the same address the product would produce. The default is
+therefore exact, not approximated, and **the core contains no multiplier**.
+
+A descriptor holds no `offset`; the offset is only the initial value of `addr`
+and `outer_base`, which live in the cursor. A stream view — what a queued
+command carries — is the descriptor plus `{inner_cursor, outer_cursor, addr,
+outer_base}`.
+
+`addr` is then mapped to a physical row, and for 128-bit accesses in LoMem to one
+of its four lanes. The unit of `addr` is layout-specific:
 
 | Layout | Domain | Unit of `q` | Row | Lane |
 |---|---|---|---|---|
@@ -460,12 +495,16 @@ lane bytes[0:7]  = B[kc*8 .. kc*8+7, column + p*8 + l]        -> accumulator 2p
 lane bytes[8:15] = B[kc*8 .. kc*8+7, column + p*8 + 4 + l]    -> accumulator 2p+1
 ```
 
-Cursors advance once per access on consumption. The Command stage owns the
-cursors and advances them at issue, so a queued command carries an immutable
-view `{descriptor, inner_cursor, outer_cursor}` and later `set_stream` or
-register writes cannot disturb work in flight. Multi-access commands advance by
-their full access count; `broadcast_mac` and `multi_mac` consume their streams
-to exhaustion (`inner_cursor = 0`, `outer_cursor = outer_count`).
+Cursors advance once per access on consumption. The Command stage owns them and
+advances them at issue, so a queued command carries an immutable view and later
+`set_stream` or register writes cannot disturb work in flight. Because a step is
+sequential, a command that consumes N accesses is walked one access per cycle at
+issue (section 19); `broadcast_mac` and `multi_mac` instead consume their streams
+to exhaustion (`inner_cursor = 0`, `outer_cursor = outer_count`) in one cycle.
+
+Fetch and WB advance their own copies of the view the same way — one step per
+allocated read, per accepted store, and per scale row — so no stage recomputes
+an address from a line number.
 
 Stream shape invariants the assembler must honour for `broadcast_mac`:
 
@@ -615,14 +654,34 @@ error, so the packet is not consumed and an assertion fires. This makes
 misordering visible instead of silently corrupting a result.
 
 Range reservations live in the Command stage: a `RESERVATIONS`-entry table of
-`{valid, seq, domain, is_write, row_low, row_high, owner}`. At issue, an
-instruction reserves one entry per memory range it will touch, computed from
-the captured stream view:
+`{valid, seq, domain, is_write, row_low, row_high, owner}`. A memory instruction
+therefore issues in three phases rather than one:
 
 ```text
-row_low  = row(q_first)
-row_high = row(q_last)                q_last = q of the final access
+CP_RUN    capture the stream views the command will carry, start the walk
+CP_RANGE  one access per cycle: take its row into [row_low, row_high] and step
+          the cursor; then the second stream, if the command has one
+CP_ISSUE  check the range against the table, and dispatch atomically
 ```
+
+Issue costs one cycle per access this way, which is always less than the work
+the command itself takes downstream, and it reuses one adder instead of building
+a parallel walk chain. A retry after a conflict does not re-walk.
+
+Two kinds of range come out of this:
+
+```text
+bounded     load_accumulators, elementwise_*, scale_accumulators,
+            write_accumulators, write_buf: at most MAX_STREAM_ACCESSES accesses,
+            so the walk gives the exact row range
+exhausting  broadcast_mac and multi_mac consume a whole descriptor, so the range
+            is the whole domain
+```
+
+The whole-domain approximation is safe because a superset can only cause extra
+stalls, and it is nearly free: reads conflict only with writes, every write range
+is exact, and a write issued after an exhausting read has to wait for Compute to
+drain that read's packets anyway.
 
 Ranges are conservative at row granularity: LoMem lane masking is ignored, so
 two 128-bit accesses in the same physical row conflict. Conflict rules:
@@ -677,7 +736,10 @@ responsibility, as are the shape invariants of section 15.
    kept because they are what routes a response back to Fetch or WB.
 2. **`DATA_Q_DEPTH = 2`, not 1.** A depth-1 FIFO would serialize Fetch and
    Compute into lockstep and lose the run-ahead the pipeline exists for. Depth
-   is a parameter; 1 still functions.
+   is a parameter; 1 still functions. `COMMAND_Q_DEPTH` is 2 rather than the
+   specified 4: a command FIFO entry carries two stream views, so depth costs
+   real flops, and one queued command per stage is enough to keep issue off the
+   critical path.
 3. **`STREAM_SLOTS = 4`** per section 1, with a 3-bit encoding field so 8 slots
    need no encoding change. Slots `>= STREAM_SLOTS` are an error.
 4. **Reduction arithmetic is block floating point.** Section 4 says the TreeMAC
@@ -695,12 +757,18 @@ responsibility, as are the shape invariants of section 15.
    semantics.
 7. **`elementwise_*` and `multi_mac` `count` is an element count** in `[1,64]`;
    `multi_mac` spreads it across `ceil(count/32)` row pairs.
-8. **One instruction issues per cycle at most**, and multi-word `set_stream`
-   takes four command cycles.
-9. **A new program does not clear accumulators.** Reset clears everything;
-   `start` clears PC, register valid bits, stream valid bits and the loop
-   stack, but software must issue `acc_reset` or `load_accumulators`.
-10. **`flush`** aborts: it clears every FIFO, stage FSM and buffer, but not the
+8. **One instruction issues per cycle at most**, `set_stream` takes two command
+   cycles, and a memory instruction takes two cycles plus one per access it
+   consumes (section 19). Nothing in the ISA is single-cycle-issue by contract.
+9. **Stream fields are narrower than the integer registers.** Offsets and cursor
+   addresses are 22-bit signed, counts 16-bit unsigned, strides 16-bit signed,
+   against 32-bit integer registers. A register-sourced `set_stream` field is
+   truncated to its field width, and because counts are unsigned the specified
+   `inner_count <= 0` error becomes `inner_count == 0`.
+10. **A new program does not clear accumulators.** Reset clears everything;
+    `start` clears PC, register valid bits, stream valid bits and the loop
+    stack, but software must issue `acc_reset` or `load_accumulators`.
+11. **`flush`** aborts: it clears every FIFO, stage FSM and buffer, but not the
     accumulators or the integer registers. Outstanding memory responses are
     dropped by ticket mismatch.
 
@@ -713,7 +781,8 @@ the core - memory contents, `done`, `error`, the stall outputs - so the tests
 constrain behavior rather than implementation.
 
 Run it with `make test-mcore`. `MCORE_ARGS='+only=<group>'` runs one group
-(`ctrl`, `acc`, `bcast`, `int8`, `multi`, `ew`, `buf`, `scale`, `dep`),
+(`ctrl`, `acc`, `bcast`, `int8`, `multi`, `ew`, `buf`, `scale`, `stride`,
+`dep`),
 `'+trace'` logs every stage dispatch and completion, and `make
 test-mcore-reorder` re-runs the whole suite with read responses returned out of
 order so the ticket matching of section 13 is exercised. Both orderings pass 352
@@ -774,9 +843,15 @@ Arithmetic:
     zeros for the six unset slots.
 17. `scale_accumulators` for `count` 12 into CoMem, checking the scale-row read,
     the per-value BF16 multiply and zero padding of the final line.
+18. An explicit `outer_stride` (`inner_count` 2, `outer_count` 2,
+    `outer_stride` 4) over four output lines, which takes the non-contiguous
+    wrap path in the cursor, the walker and the WB store view, and checks that
+    the skipped lanes are left untouched. The dependency test additionally uses
+    a zero `inner_stride` so both of its passes read the same line.
 
-Not yet covered, in rough priority order: backpressure with a stage held not
-ready and the atomic-dispatch case where only one of two stages would accept;
+The suite passes 387 checks. Not yet covered, in rough priority order:
+backpressure with a stage held not ready and the atomic-dispatch case where only
+one of two stages would accept;
 issue-time capture against a later `set_stream` to the same slot; `count` over
 32 for `scale_accumulators`, which is where the second scale row and the
 `SCALE_BUFFER_ENTRIES` wrap are exercised; a loop-driven tiled GEMM over

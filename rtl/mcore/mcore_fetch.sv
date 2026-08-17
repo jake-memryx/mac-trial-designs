@@ -71,24 +71,26 @@ module mcore_fetch
     logic [COUNTER_WIDTH-1:0]    b_rows;
     logic [COUNTER_WIDTH-1:0]    inner_total;
     logic [COUNTER_WIDTH-1:0]    b_inner_total;
-    logic signed [INT_WIDTH-1:0] outer_total;
-    logic signed [INT_WIDTH-1:0] a_total;
+    // Outer iteration counts follow the descriptor width, not the integer
+    // register width.
+    logic [STREAM_COUNT_WIDTH-1:0] outer_total;
+    logic [STREAM_COUNT_WIDTH-1:0] a_total;
     logic                        wide_rows;
     logic                        int8_b;
     logic                        uses_b;
 
     // Allocation side.
     stream_view_t                a_view, b_view;
-    logic signed [INT_WIDTH-1:0] a_count;
+    logic [STREAM_COUNT_WIDTH-1:0] a_count;
     logic [COUNTER_WIDTH-1:0]    b_inner;
-    logic signed [INT_WIDTH-1:0] b_outer;
+    logic [STREAM_COUNT_WIDTH-1:0] b_outer;
     logic                        a_alloc_more, b_alloc_more;
     logic                        a_alloc_valid, a_alloc_ready;
     logic                        b_alloc_valid, b_alloc_ready;
 
     // Consumption side.
     logic [COUNTER_WIDTH-1:0]    cons_inner;
-    logic signed [INT_WIDTH-1:0] cons_outer;
+    logic [STREAM_COUNT_WIDTH-1:0] cons_outer;
     logic                        last_packet;
     logic                        a_pop, b_pop;
     logic                        a_head_valid, b_head_valid;
@@ -139,16 +141,16 @@ module mcore_fetch
         // values, one operand line per two groups.
         inner_total   = groups;
         b_inner_total = lines;
-        outer_total   = 32'sd1;
-        a_total       = $signed({26'b0, lines});
+        outer_total   = STREAM_COUNT_WIDTH'(1'b1);
+        a_total       = {{(STREAM_COUNT_WIDTH-COUNTER_WIDTH){1'b0}}, lines};
         uses_b        = 1'b1;
         wide_rows     = 1'b0;
         case (command.op)
             FETCH_ACC_LOAD: begin
                 inner_total   = 6'd1;
                 b_inner_total = 6'd0;
-                outer_total   = 32'sd1;
-                a_total       = 32'sd1;
+                outer_total   = STREAM_COUNT_WIDTH'(1'b1);
+                a_total       = STREAM_COUNT_WIDTH'(1'b1);
                 uses_b        = 1'b0;
                 wide_rows     = 1'b0;
             end
@@ -163,8 +165,8 @@ module mcore_fetch
             FETCH_MULTI: begin
                 inner_total   = rows;
                 b_inner_total = rows;
-                outer_total   = 32'sd1;
-                a_total       = $signed({26'b0, rows});
+                outer_total   = STREAM_COUNT_WIDTH'(1'b1);
+                a_total       = {{(STREAM_COUNT_WIDTH-COUNTER_WIDTH){1'b0}}, rows};
                 uses_b        = 1'b1;
                 wide_rows     = 1'b1;
             end
@@ -190,8 +192,8 @@ module mcore_fetch
         .alloc_valid  (a_alloc_valid),
         .alloc_ready  (a_alloc_ready),
         .alloc_domain (a_view.desc.domain),
-        .alloc_row    (stream_row(a_view.desc, stream_index(a_view), wide_rows)),
-        .alloc_lane   (stream_lane(a_view.desc, stream_index(a_view), wide_rows)),
+        .alloc_row    (stream_row(a_view.desc, stream_addr(a_view), wide_rows)),
+        .alloc_lane   (stream_lane(a_view.desc, stream_addr(a_view), wide_rows)),
         .req_valid    (a_req_valid),
         .req_ready    (a_req_ready),
         .req_domain   (a_req_domain),
@@ -220,8 +222,8 @@ module mcore_fetch
         .alloc_valid  (b_alloc_valid),
         .alloc_ready  (b_alloc_ready),
         .alloc_domain (b_view.desc.domain),
-        .alloc_row    (stream_row(b_view.desc, stream_index(b_view), wide_rows)),
-        .alloc_lane   (stream_lane(b_view.desc, stream_index(b_view), wide_rows)),
+        .alloc_row    (stream_row(b_view.desc, stream_addr(b_view), wide_rows)),
+        .alloc_lane   (stream_lane(b_view.desc, stream_addr(b_view), wide_rows)),
         .req_valid    (b_req_valid),
         .req_ready    (b_req_ready),
         .req_domain   (b_req_domain),
@@ -297,7 +299,7 @@ module mcore_fetch
     assign packet_taken = pkt_valid && pkt_ready;
 
     assign last_packet = (cons_inner == inner_total - 1'b1) &&
-                         (cons_outer == outer_total - 32'sd1);
+                         (cons_outer == outer_total - STREAM_COUNT_WIDTH'(1'b1));
 
     // A is held for every group of its row; B is held for both INT8 halves.
     always_comb begin
@@ -440,14 +442,14 @@ module mcore_fetch
                 end
                 F_RUN: begin
                     if (a_alloc_valid && a_alloc_ready) begin
-                        a_view  <= stream_advance(a_view, 1);
-                        a_count <= a_count + 32'sd1;
+                        a_view  <= stream_step(a_view);
+                        a_count <= a_count + STREAM_COUNT_WIDTH'(1'b1);
                     end
                     if (b_alloc_valid && b_alloc_ready) begin
-                        b_view <= stream_advance(b_view, 1);
+                        b_view <= stream_step(b_view);
                         if (b_inner == b_inner_total - 1'b1) begin
                             b_inner <= '0;
-                            b_outer <= b_outer + 32'sd1;
+                            b_outer <= b_outer + STREAM_COUNT_WIDTH'(1'b1);
                         end else begin
                             b_inner <= b_inner + 1'b1;
                         end
@@ -457,7 +459,7 @@ module mcore_fetch
                             state <= F_DONE;
                         end else if (cons_inner == inner_total - 1'b1) begin
                             cons_inner <= '0;
-                            cons_outer <= cons_outer + 32'sd1;
+                            cons_outer <= cons_outer + STREAM_COUNT_WIDTH'(1'b1);
                         end else begin
                             cons_inner <= cons_inner + 1'b1;
                         end

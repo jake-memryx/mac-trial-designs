@@ -219,9 +219,12 @@ package mcore_prog_pkg;
     endfunction
 
     // ------------------------------------------- section 12: set_stream
+    // Two words: word 0 carries the identity, the base row and the 22-bit
+    // offset, word 1 the two 16-bit counts and the two 16-bit strides.
+    //
     // reg_select bit 4 = offset, 3 = inner_count, 2 = outer_count,
     // 1 = inner_stride, 0 = outer_stride; a selected field carries a register
-    // index in the low four bits of its 32-bit slot instead of a literal.
+    // index in the low four bits of its own slot instead of a literal.
     function automatic void asm_set_stream(
             output instr_t      words [SETSTREAM_WORDS],
             input  int unsigned id,
@@ -237,10 +240,11 @@ package mcore_prog_pkg;
             input  logic [4:0]  reg_select);
         words[0] = {OP_SET_STREAM, STREAM_ID_WIDTH'(id), domain, layout,
                     MEM_ROW_WIDTH'(base_row), has_outer_stride, reg_select,
-                    31'b0};
-        words[1] = {asm_imm(offset), asm_imm(inner_count)};
-        words[2] = {asm_imm(outer_count), asm_imm(inner_stride)};
-        words[3] = {asm_imm(outer_stride), {INT_WIDTH{1'b0}}};
+                    STREAM_ADDR_WIDTH'(offset), 9'b0};
+        words[1] = {STREAM_COUNT_WIDTH'(inner_count),
+                    STREAM_COUNT_WIDTH'(outer_count),
+                    STREAM_STRIDE_WIDTH'(inner_stride),
+                    STREAM_STRIDE_WIDTH'(outer_stride)};
     endfunction
 
     // ------------------------------------------ section 4: format helpers
